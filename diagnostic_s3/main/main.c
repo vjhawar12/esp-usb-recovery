@@ -178,8 +178,7 @@ void tinyusb_cdc_rx_callback(int itf, cdcacm_event_t *event) {
     } 
 }   
 
-void write_to_linux(const uint8_t* in_buffer) {
-    size_t size = strnlen((const char*)in_buffer, 256); 
+void write_to_linux(const uint8_t* in_buffer, size_t size) {
     tinyusb_cdcacm_write_queue(CDC_INTERFACE_NUM, in_buffer, size);
     esp_err_t err = tinyusb_cdcacm_write_flush(CDC_INTERFACE_NUM, 0);
     if (err != ESP_OK) {
@@ -187,14 +186,19 @@ void write_to_linux(const uint8_t* in_buffer) {
     }
 }
 
-void write_to_mcu(const char* string) {
-    size_t size = strnlen(string, 256); 
+void write_to_mcu(const char* string, size_t size) {
     uart_write_bytes(UART_NUM, string, strnlen(string, size));
 }
 
-bool read_from_mcu(uint8_t* buffer, uint8_t max_time_ms) {
-    int bytes_read = uart_read_bytes(UART_NUM, buffer, sizeof(buffer), pdMS_TO_TICKS(max_time_ms)); 
-    return bytes_read > 0? true : false;
+int read_from_mcu(uint8_t* buffer, uint8_t max_length, uint8_t max_time_ms) {
+    int bytes_read = uart_read_bytes(UART_NUM, buffer, max_length, pdMS_TO_TICKS(max_time_ms)); 
+    if (bytes_read == -1) {
+        LOG("Error: Timeout");
+    } else if (bytes_read == 0) {
+        LOG("Error: Reading from empty buffer");
+    } else {
+        return bytes_read; 
+    }
 }
 
 /* 
@@ -206,7 +210,7 @@ PING
 */
 void parse_command(void *pvParams) {
     payload_t payload;
-    uint8_t out_buffer[64];
+    uint8_t out_buffer[128];
     uint8_t in_buffer[128];
     uint32_t rate;
     while (1) {
@@ -215,18 +219,25 @@ void parse_command(void *pvParams) {
             cmd.stream_on = true;
         } else if (!strncmp((const char*)payload.data, "STREAM OFF\r\n", 13)) {
             cmd.stream_on = false;
-        } else if (sscanf((const char*)payload.data, "SET RATE %d\r\n", (int*)&rate) == 1) {
-            if (rate < MAX_RATE_HZ) {
+        } else if (sscanf((const char*)payload.data, "SET RATE %u\r\n", &rate) == 1) {
+            if (rate <= MAX_RATE_HZ) {
                 cmd.rate = rate;
                 snprintf((char*)out_buffer, sizeof(out_buffer), "SET RATE %d", (int)rate); 
+                write_to_mcu(out_buffer, 128); 
+                snprintf((char*)out_buffer, sizeof(out_buffer), "OK RATE=%d", (int)rate); 
+                write_to_linux(out_buffer, 128);
+            } else if (rate > MAX_RATE_HZ) {
+                write_to_linux((const uint8_t*)"Rate too high\r\n", 16);
             } else {
-                write_to_linux((const uint8_t*)"Rate too high\r\n");
+                write_to_linux((const uint8_t*)"Rate cannot be 0 Hz\r\n", 22);
             }
         } else if (!strncmp((const char*)payload.data, "GET STATUS\r\n", 13)) {
-            write_to_mcu("GET STATUS\r\n"); 
+            write_to_mcu("GET STATUS\r\n", 13); 
             uart_read_bytes(UART_NUM, in_buffer, sizeof(in_buffer), pdMS_TO_TICKS(300)); 
+            snprintf(out_buffer, "S3 Status Report:\n%s", in_buffer); 
+            write_to_linux(out_buffer, 128);
         } else if (!strncmp((const char*)payload.data, "PING", 4)) { 
-            write_to_linux("PONG");
+            write_to_linux("PONG\r\n", 7);
         } else {
             
         }
@@ -234,14 +245,15 @@ void parse_command(void *pvParams) {
 }
 
 void get_sensor_data(void *pvParams) {
-    TickType_t pxPreviousWakeTime;
-    const TickType_t frequency = pdMS_TO_TICKS(1 / cmd.rate); 
+    TickType_t pxPreviousWakeTime = xTaskGetTickCount();
     uint8_t buffer[128];
     while (1) {
+        TickType_t frequency = pdMS_TO_TICKS(1000 / cmd.rate); 
         if (cmd.stream_on) {
-            write_to_mcu(GET_SENSOR_DATA_CMD); 
-            if (read_from_mcu(buffer, 50)) {
-                write_to_linux(buffer); 
+            write_to_mcu(GET_SENSOR_DATA_CMD, 18); 
+            int bytes_read = read_from_mcu(buffer, 128, 50);
+            if (bytes_read > 0) {
+                write_to_linux(buffer, bytes_read); 
             }
         }
         xTaskDelayUntil(&pxPreviousWakeTime, frequency); 
@@ -268,7 +280,9 @@ void app_main(void) {
     usb_init();
     uart_init();
     register_callbacks();
-    xTaskCreate(parse_command, "Parse Command Task", 512, NULL, 5, NULL); 
+    xTaskCreate(parse_command, "Parse Command Task", 512, NULL, 5, NULL);
+    xTaskCreate(get_sensor_data, "Get Sensor Data", 512, NULL, 10, NULL);  
+    cmd.rate = 60;
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(100));
     }
