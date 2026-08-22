@@ -30,6 +30,10 @@
 #define UART_NUM UART_NUM_2
 
 #define MAX_RATE_HZ 60
+#define GET_SENSOR_DATA_CMD "GET SENSOR DATA\r\n"
+#define PING_CMD "PING\r\n"
+#define GET_STATUS_CMD "GET STATUS\r\n"
+#define GET_RESET_REASON "GET RESET REASON\r\n"
 
 typedef enum connection_status_t {
     DISCONNECTED,   
@@ -183,8 +187,14 @@ void write_to_linux(const uint8_t* in_buffer) {
     }
 }
 
-void write_to_mcu(const char* string, size_t size) {
+void write_to_mcu(const char* string) {
+    size_t size = strnlen(string, 256); 
     uart_write_bytes(UART_NUM, string, strnlen(string, size));
+}
+
+bool read_from_mcu(uint8_t* buffer, uint8_t max_time_ms) {
+    int bytes_read = uart_read_bytes(UART_NUM, buffer, sizeof(buffer), pdMS_TO_TICKS(max_time_ms)); 
+    return bytes_read > 0? true : false;
 }
 
 /* 
@@ -203,32 +213,39 @@ void parse_command(void *pvParams) {
         xQueueReceive(queue, &payload, portMAX_DELAY);
         if (!strncmp((const char*)payload.data, "STREAM ON\r\n", 12)) {
             cmd.stream_on = true;
-            write_to_mcu( "GET SENSOR DATA\r\n", 18);
         } else if (!strncmp((const char*)payload.data, "STREAM OFF\r\n", 13)) {
             cmd.stream_on = false;
-            write_to_mcu("STOP SENSOR DATA\r\n", 18);
         } else if (sscanf((const char*)payload.data, "SET RATE %d\r\n", (int*)&rate) == 1) {
             if (rate < MAX_RATE_HZ) {
                 cmd.rate = rate;
                 snprintf((char*)out_buffer, sizeof(out_buffer), "SET RATE %d", (int)rate); 
-                write_to_mcu((const char*)out_buffer, 12);
             } else {
                 write_to_linux((const uint8_t*)"Rate too high\r\n");
             }
         } else if (!strncmp((const char*)payload.data, "GET STATUS\r\n", 13)) {
-            write_to_mcu("GET STATUS\r\n", 13); 
+            write_to_mcu("GET STATUS\r\n"); 
             uart_read_bytes(UART_NUM, in_buffer, sizeof(in_buffer), pdMS_TO_TICKS(300)); 
-        } else if (!strncmp((const char*)payload.data, "PING", 4)) {
-            write_to_mcu("PING\r\n", 7); 
-            // expected response: PONG  
-            int bytes_read = uart_read_bytes(UART_NUM, in_buffer, sizeof(in_buffer), pdMS_TO_TICKS(300)); 
-            if (bytes_read > 0) {
-                write_to_linux(in_buffer);
-            }
+        } else if (!strncmp((const char*)payload.data, "PING", 4)) { 
+            write_to_linux("PONG");
         } else {
             
         }
     }       
+}
+
+void get_sensor_data(void *pvParams) {
+    TickType_t pxPreviousWakeTime;
+    const TickType_t frequency = pdMS_TO_TICKS(1 / cmd.rate); 
+    uint8_t buffer[128];
+    while (1) {
+        if (cmd.stream_on) {
+            write_to_mcu(GET_SENSOR_DATA_CMD); 
+            if (read_from_mcu(buffer, 50)) {
+                write_to_linux(buffer); 
+            }
+        }
+        xTaskDelayUntil(&pxPreviousWakeTime, frequency); 
+    }
 }
 
 void register_callbacks() {
