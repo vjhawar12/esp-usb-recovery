@@ -19,5 +19,17 @@
       "inheritDefault": "hidden"
     }
   },
-  "idf.currentSetup": "/home/vedant/.espressif/v6.0/esp-idf"
+  "idf.currentSetup": "/home/vedant/.espressif/v6.0/esp-idf",
+  "idf.openOcdConfigs": [
+    "board/esp32s3-builtin.cfg"
+  ],
+  "idf.customExtraVars": {
+    "IDF_TARGET": "esp32s3"
+  },
+  "clangd.path": "/home/vedant/.espressif/tools/esp-clang/esp-20.1.1_20250829/esp-clang/bin/clangd",
+  "clangd.arguments": [
+    "--background-index",
+    "--query-driver=**",
+    "--compile-commands-dir=/home/vedant/dev/esp-usb-recovery/build"
+  ]
 }
