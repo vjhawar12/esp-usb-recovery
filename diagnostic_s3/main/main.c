@@ -7,7 +7,7 @@
 #include "esp_log.h"
 #include "driver/uart.h"
 
-#define TAG "ESP32-S3 Recovery & Diagnostics"
+#define TAG "Diagnostic ESP32-S3"
 #define LOG(msg) ESP_LOGW(TAG, msg)
 #define PID 0x050
 #define RELEASE_NUM 0x0200
@@ -35,6 +35,9 @@
 #define GET_STATUS_CMD "GET STATUS\r\n"
 #define GET_RESET_REASON "GET RESET REASON\r\n"
 
+#define VENDOR_MAX_BUFFER_SIZE 64
+#define CDC_MAX_BUFFER_SIZE 64
+
 typedef enum connection_status_t {
     DISCONNECTED,   
     MOUNTED,
@@ -42,19 +45,36 @@ typedef enum connection_status_t {
     RESUMED
 } connection_status_t;
 
-typedef struct command_t {
-    bool stream_on;
-    uint8_t rate;
-} command_t;
+typedef enum payload_type_t {
+    VENDOR,
+    CDC
+} payload_type_t;
 
 typedef struct payload_t {
-    uint8_t data[64];
+    union {
+        uint8_t cdc_data[CDC_MAX_BUFFER_SIZE + 1];
+        uint8_t vendor_data[VENDOR_MAX_BUFFER_SIZE + 1];
+    } buffer;
+    payload_type_t type;
     size_t length;
 } payload_t;
 
-command_t cmd;
+typedef enum mcu_interface_err_t {
+    OK,
+    IDENTIFY,
+    GET_STATUS,
+    CAPTURE_STATE,
+    GET_FAULT_CONTEXT,
+    DIAGNOSE,
+    VERIFY_FIRMWARE,
+    RESET_TARGET,
+    ENTER_RECOVERY,
+    RECOVER_TARGET,
+    GENERATE_REPORT
+} mcu_interface_err_t;
+
 connection_status_t conn_status;
-QueueHandle_t queue, uart_queue; // event queue for UART controller to transmit to CPU
+QueueHandle_t cdc_queue, vendor_queue, uart_queue; // event queue for UART controller to transmit to CPU
 
 const char* string_desc[] = {
     (const char[]) { 0x09, 0x04 }, // english only
@@ -113,7 +133,6 @@ const tinyusb_phy_config_t phy = {
     .self_powered = false,
 }; 
 
-
 // high level hook -- not critical for operation just keeping track of state
 void event_cb(tinyusb_event_t *event, void *arg) {
     switch (event->id) {
@@ -166,28 +185,55 @@ void uart_init() {
 }
 
 // when linux computer sends data to esp via cdc interface
-// handle things like STREAM ON/OFF, SET RATE, etc
+// sends live logs to linux 
 void tinyusb_cdc_rx_callback(int itf, cdcacm_event_t *event) {
-    payload_t payload;
-    size_t num_bytes_read;
     if (itf == CDC_INTERFACE_NUM && event->type == CDC_EVENT_RX) {
-        tinyusb_cdcacm_read(CDC_INTERFACE_NUM, payload.data, sizeof(payload.data) - 1, &num_bytes_read); 
-        payload.data[num_bytes_read] = 0; 
+        payload_t payload;
+        size_t num_bytes_read;
+        payload.type = CDC;
+        tinyusb_cdcacm_read(CDC_INTERFACE_NUM, payload.buffer.cdc_data, sizeof(payload.length) - 1, &num_bytes_read); 
+        payload.buffer.cdc_data[num_bytes_read] = 0; 
         payload.length = num_bytes_read;  
-        xQueueSend(queue, &payload, 0);
+        xQueueSend(cdc_queue, &payload, 0);
     } 
 }   
 
-void write_to_linux(const uint8_t* in_buffer, size_t size) {
+// vendor equivalent of cdc rx callback
+/* 
+handles
+IDENTIFY
+GET_STATUS
+CAPTURE_STATE
+GET_FAULT_CONTEXT
+DIAGNOSE
+VERIFY_FIRMWARE
+RESET_TARGET
+ENTER_RECOVERY
+RECOVER_TARGET
+GENERATE_REPORT
+*/
+void tud_vendor_rx_cb(uint8_t idx, const uint8_t *buffer, uint32_t bufsize) {
+    if (idx == 0) {
+        payload_t payload;
+        payload.type = VENDOR;
+        memcpy(payload.buffer.vendor_data, buffer, bufsize * sizeof(uint8_t));
+        payload.buffer.vendor_data[bufsize] = 0; 
+        payload.length = bufsize;  
+        xQueueSend(vendor_queue, &payload, 0);
+    }
+}
+
+esp_err_t write_to_linux(const uint8_t* in_buffer, size_t size) {
     tinyusb_cdcacm_write_queue(CDC_INTERFACE_NUM, in_buffer, size);
     esp_err_t err = tinyusb_cdcacm_write_flush(CDC_INTERFACE_NUM, 0);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "CDC ACM write flush error: %s", esp_err_to_name(err));
     }
+    return err;
 }
 
-void write_to_mcu(const char* string, size_t size) {
-    uart_write_bytes(UART_NUM, string, strnlen(string, size));
+int write_to_mcu(const char* string, size_t size) {
+    return uart_write_bytes(UART_NUM, string, strnlen(string, size));
 }
 
 int read_from_mcu(uint8_t* buffer, uint8_t max_length, uint8_t max_time_ms) {
@@ -196,68 +242,101 @@ int read_from_mcu(uint8_t* buffer, uint8_t max_length, uint8_t max_time_ms) {
         LOG("Error: Timeout");
     } else if (bytes_read == 0) {
         LOG("Error: Reading from empty buffer");
-    } else {
-        return bytes_read; 
-    }
+    } 
+    return bytes_read;
 }
 
-/* 
-STREAM_ON
-STREAM_OFF
-SET_RATE <hz>
-GET_STATUS
-PING
+mcu_interface_err_t handle_identify() {
+    return write_to_linux((uint8_t*)"HANDLE IDENTIFY PLACEHOLDER\r\n", 30) != ESP_OK? IDENTIFY : OK;
+}
+
+mcu_interface_err_t handle_get_status() {
+    return write_to_linux((uint8_t*)"HANDLE GET STATUS PLACEHOLDER\r\n", 30) != ESP_OK? GET_STATUS : OK;
+}
+
+mcu_interface_err_t handle_capture_state() {
+    return write_to_linux((uint8_t*)"HANDLE CAPUTURE STATE PLACEHOLDER\r\n", 30) != ESP_OK? CAPTURE_STATE : OK;
+}
+
+mcu_interface_err_t handle_get_fault_context() {
+    return write_to_linux((uint8_t*)"HANDLE GET FAULT CONTEXT\r\n", 30) != ESP_OK? GET_FAULT_CONTEXT : OK;
+}
+
+mcu_interface_err_t handle_diagnose() {
+    return write_to_linux((uint8_t*)"HANDLE DIAGNOSE PLACEHOLDER\r\n", 30) != ESP_OK? DIAGNOSE : OK;
+}   
+
+mcu_interface_err_t handle_verify_firmware() {
+    return write_to_linux((uint8_t*)"HANDLE VERIFY FIRMWARE PLACEHOLDER\r\n", 30) != ESP_OK? VERIFY_FIRMWARE : OK;
+}
+
+mcu_interface_err_t handle_reset_target() {
+    return write_to_linux((uint8_t*)"HANDLE RESET TARGET PLACEHOLDER\r\n", 30) != ESP_OK? RESET_TARGET : OK;
+}
+
+mcu_interface_err_t handle_enter_recovery() {
+    return write_to_linux((uint8_t*)"HANDLE ENTER RECOVERY PLACEHOLDER\r\n", 30) != ESP_OK? ENTER_RECOVERY : OK;
+}
+
+mcu_interface_err_t handle_recover_target() {
+    return write_to_linux((uint8_t*)"HANDLE RECOVER TARGET PLACEHOLDER\r\n", 30) != ESP_OK? RECOVER_TARGET : OK;
+}
+
+mcu_interface_err_t handle_generate_report() {
+    return write_to_linux((uint8_t*)"HANDLE GENERATE REPORT PLACEHOLDER\r\n", 30) != ESP_OK? GENERATE_REPORT : OK;
+}
+
+/*  
++--------------------+-------------------------------------------------------------------+------------------------------------+
+| Command            | Technician is asking:                                             | Intrusiveness                      |
++--------------------+-------------------------------------------------------------------+------------------------------------+
+| PING               | “Is my diagnostic S3 alive?”                                      | None                               |
+| IDENTIFY           | “What target did I connect to?”                                   | None                               |
+| GET_STATUS         | “What condition is it in right now?”                              | None                               |
+| CAPTURE_STATE      | “Preserve volatile evidence before we touch anything.”            | Low                                |
+| GET_FAULT_CONTEXT  | “What evidence exists about why it failed?”                       | Low                                |
+| DIAGNOSE           | “Put all the evidence together and classify the failure.”         | Low                                |
+| VERIFY_FIRMWARE    | “Does the installed image look intact/valid?”                     | Low                                |
+| RESET_TARGET       | “Try a simple hardware reset.”                                    | Destructive to volatile state      |
+| ENTER_RECOVERY     | “Bypass the application and enter ROM bootloader/debug recovery.” | Higher                             |
+| RECOVER_TARGET     | “Automatically perform the appropriate recovery procedure.”       | Potentially destructive            |
+| GENERATE_REPORT    | “Explain what happened and what was done.”                        | None                               |
++--------------------+-------------------------------------------------------------------+------------------------------------+
 */
-void parse_command(void *pvParams) {
+void parse_vendor_commands(void *pvParams) {
     payload_t payload;
-    uint8_t out_buffer[128];
+    uint8_t out_buffer[256];
     uint8_t in_buffer[128];
     uint32_t rate;
+    mcu_interface_err_t err;
     while (1) {
-        xQueueReceive(queue, &payload, portMAX_DELAY);
-        if (!strncmp((const char*)payload.data, "STREAM ON\r\n", 12)) {
-            cmd.stream_on = true;
-        } else if (!strncmp((const char*)payload.data, "STREAM OFF\r\n", 13)) {
-            cmd.stream_on = false;
-        } else if (sscanf((const char*)payload.data, "SET RATE %u\r\n", &rate) == 1) {
-            if (rate <= MAX_RATE_HZ) {
-                cmd.rate = rate;
-                snprintf((char*)out_buffer, sizeof(out_buffer), "SET RATE %d", (int)rate); 
-                write_to_mcu(out_buffer, 128); 
-                snprintf((char*)out_buffer, sizeof(out_buffer), "OK RATE=%d", (int)rate); 
-                write_to_linux(out_buffer, 128);
-            } else if (rate > MAX_RATE_HZ) {
-                write_to_linux((const uint8_t*)"Rate too high\r\n", 16);
-            } else {
-                write_to_linux((const uint8_t*)"Rate cannot be 0 Hz\r\n", 22);
-            }
-        } else if (!strncmp((const char*)payload.data, "GET STATUS\r\n", 13)) {
-            write_to_mcu("GET STATUS\r\n", 13); 
-            uart_read_bytes(UART_NUM, in_buffer, sizeof(in_buffer), pdMS_TO_TICKS(300)); 
-            snprintf(out_buffer, "S3 Status Report:\n%s", in_buffer); 
-            write_to_linux(out_buffer, 128);
-        } else if (!strncmp((const char*)payload.data, "PING", 4)) { 
-            write_to_linux("PONG\r\n", 7);
+        xQueueReceive(vendor_queue, &payload, portMAX_DELAY);
+        if (!strncmp((const char*)payload.buffer.vendor_data, "PING\r\n", 7)) {
+            write_to_linux((const uint8_t*)"PONG\r\n", 7);
+        } else if (!strncmp((const char*)payload.buffer.vendor_data, "IDENTIFY\r\n", 11)) {
+            err = handle_identify();
+        } else if (!strncmp((const char*)payload.buffer.vendor_data, "GET STATUS\r\n", 13))  {
+            err = handle_get_status();
+        } else if (!strncmp((const char*)payload.buffer.vendor_data, "CAPTURE STATE\r\n", 16)) {
+            err = handle_capture_state();
+        } else if (!strncmp((const char*)payload.buffer.vendor_data, "GET FAULT CONTEXT\r\n", 20)) { 
+            err = handle_get_fault_context();
+        } else if (!strncmp((const char*)payload.buffer.vendor_data, "DIAGNOSE\r\n", 11)) { 
+            err = handle_diagnose();
+        } else if (!strncmp((const char*)payload.buffer.vendor_data, "VERIFY FIRMWARE\r\n", 18)) { 
+            err = handle_verify_firmware();
+        } else if (!strncmp((const char*)payload.buffer.vendor_data, "RESET TARGET\r\n", 15)) {
+            err = handle_reset_target();
+        } else if (!strncmp((const char*)payload.buffer.vendor_data, "ENTER RECOVERY\r\n", 17)) { 
+            err = handle_enter_recovery();
+        } else if (!strncmp((const char*)payload.buffer.vendor_data, "RECOVER TARGET\r\n", 17)) { 
+            err = handle_recover_target();
+        } else if (!strncmp((const char*)payload.buffer.vendor_data, "GENERATE REPORT\r\n", 18)) { 
+            err = handle_generate_report();
         } else {
             
         }
     }       
-}
-
-void get_sensor_data(void *pvParams) {
-    TickType_t pxPreviousWakeTime = xTaskGetTickCount();
-    uint8_t buffer[128];
-    while (1) {
-        TickType_t frequency = pdMS_TO_TICKS(1000 / cmd.rate); 
-        if (cmd.stream_on) {
-            write_to_mcu(GET_SENSOR_DATA_CMD, 18); 
-            int bytes_read = read_from_mcu(buffer, 128, 50);
-            if (bytes_read > 0) {
-                write_to_linux(buffer, bytes_read); 
-            }
-        }
-        xTaskDelayUntil(&pxPreviousWakeTime, frequency); 
-    }
 }
 
 void register_callbacks() {
@@ -272,7 +351,8 @@ void register_callbacks() {
 }
 
 void freertos_init() {
-    queue = xQueueCreate(5, sizeof(payload_t));
+    cdc_queue = xQueueCreate(5, sizeof(payload_t));
+    vendor_queue = xQueueCreate(5, sizeof(payload_t));
 }
 
 void app_main(void) {
@@ -280,9 +360,8 @@ void app_main(void) {
     usb_init();
     uart_init();
     register_callbacks();
-    xTaskCreate(parse_command, "Parse Command Task", 512, NULL, 5, NULL);
-    xTaskCreate(get_sensor_data, "Get Sensor Data", 512, NULL, 10, NULL);  
-    cmd.rate = 60;
+    xTaskCreate(parse_vendor_commands, "Parse Vendor Commands Task", 512, NULL, 5, NULL);
+    vTaskStartScheduler();
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(100));
     }
