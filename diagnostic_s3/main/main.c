@@ -6,7 +6,8 @@
 #include "esp_err.h"
 #include "esp_log.h"
 #include "driver/uart.h"
-#include "tusb_config.h"
+//#include "tusb_config.h"
+#include "device/usbd_pvt.h"
 
 #define TAG "Diagnostic ESP32-S3"
 #define LOG(msg) ESP_LOGW(TAG, msg)
@@ -20,8 +21,11 @@
 #define TUD_VENDOR_DESC_LEN 23
 #define CONFIG_LEN (TUD_CDC_DESC_LEN + TUD_VENDOR_DESC_LEN + TUD_CONFIG_DESC_LEN)
 
-#define EP3_IN 0x83
-#define EP3_OUT 0x03
+#define VENDOR_BULK_IN 0x83
+#define VENDOR_BULK_OUT 0x03
+#define CDC_NOTIFICATION_IN  0x81
+#define CDC_DATA_OUT         0x02
+#define CDC_DATA_IN          0x82
 
 // vendor interface with 2 endpoints, EP3 Bulk Out and EP3 Bulk In
 #define TUD_VENDOR_DESCRIPTOR_CUSTOM(_itfnum,_stridx,_epin,_epout,_epsize) \
@@ -36,12 +40,6 @@
 #define UART_DTR 8
 #define UART_DSR 9
 #define UART_NUM UART_NUM_2
-
-#define MAX_RATE_HZ 60
-#define GET_SENSOR_DATA_CMD "GET SENSOR DATA\r\n"
-#define PING_CMD "PING\r\n"
-#define GET_STATUS_CMD "GET STATUS\r\n"
-#define GET_RESET_REASON "GET RESET REASON\r\n"
 
 #define VENDOR_MAX_BUFFER_SIZE 64
 #define CDC_MAX_BUFFER_SIZE 64
@@ -59,9 +57,14 @@ typedef enum payload_type_t {
 } payload_type_t;
 
 typedef enum vendor_err_t {
-    OK,
-    TX_FULL,
+    VENDOR_ERR_OK,
+    VENDOR_TX_FULL,
 } vendor_err_t;
+
+typedef enum cdc_err_t {
+    CDC_ERR_OK,
+    CDC_TX_FULL,
+} cdc_err_t;
 
 typedef struct payload_t {
     union {
@@ -73,7 +76,7 @@ typedef struct payload_t {
 } payload_t;
 
 typedef enum mcu_interface_err_t {
-    OK,
+    MCU_INTERFACE_ERR_OK,
     IDENTIFY,
     GET_STATUS,
     CAPTURE_STATE,
@@ -120,7 +123,7 @@ uint8_t full_speed_config[] = {
     // config num = 1; num interfaces = 3
     TUD_CONFIG_DESCRIPTOR(1, 3, 4, CONFIG_LEN, 0, 100),
     TUD_CDC_DESCRIPTOR(CDC_INTERFACE_NUM, 5, 0x81, 8, 0x02, 0x82, 64),
-    TUD_VENDOR_DESCRIPTOR_CUSTOM(VENDOR_INTERFACE_NUM, 6, EP3_IN, EP3_OUT, 64),
+    TUD_VENDOR_DESCRIPTOR_CUSTOM(VENDOR_INTERFACE_NUM, 6, VENDOR_BULK_IN, VENDOR_BULK_OUT, 64),
 }; 
 
 /* 
@@ -207,7 +210,7 @@ void tinyusb_cdc_rx_callback(int itf, cdcacm_event_t *event) {
         payload_t payload;
         size_t num_bytes_read;
         payload.type = CDC;
-        tinyusb_cdcacm_read(CDC_INTERFACE_NUM, payload.buffer.cdc_data, sizeof(payload.buffer.cdc_data), &num_bytes_read); 
+        tinyusb_cdcacm_read(CDC_INTERFACE_NUM, payload.buffer.cdc_data, sizeof(payload.buffer.cdc_data) - 1, &num_bytes_read); 
         payload.buffer.cdc_data[num_bytes_read] = 0; 
         payload.length = num_bytes_read;  
         xQueueSend(cdc_queue, &payload, 0);
@@ -228,10 +231,11 @@ ENTER_RECOVERY
 RECOVER_TARGET
 GENERATE_REPORT
 */
-void tud_vendor_rx_cb(uint8_t idx, const uint8_t *buffer, uint32_t bufsize) {
+void tud_vendor_rx_cb(uint8_t idx, const uint8_t *buffer, uint16_t bufsize) {
     if (idx == 0) {
         payload_t payload;
         payload.type = VENDOR;
+        if (bufsize > VENDOR_MAX_BUFFER_SIZE) return;
         memcpy(payload.buffer.vendor_data, buffer, bufsize * sizeof(uint8_t));
         payload.buffer.vendor_data[bufsize] = 0; 
         payload.length = bufsize;  
@@ -239,27 +243,53 @@ void tud_vendor_rx_cb(uint8_t idx, const uint8_t *buffer, uint32_t bufsize) {
     }
 }
 
-esp_err_t cdc_write_to_linux(const uint8_t* in_buffer, size_t size) {
-    tinyusb_cdcacm_write_queue(CDC_INTERFACE_NUM, in_buffer, size);
-    esp_err_t err = tinyusb_cdcacm_write_flush(CDC_INTERFACE_NUM, 0);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "CDC ACM write flush error: %s", esp_err_to_name(err));
+
+cdc_err_t cdc_write_string(char* buffer) {
+    size_t size = strlen(buffer);
+    // claim endpoint before submiting transfer
+    if (!usbd_edpt_claim(0, CDC_DATA_IN)) {
+        return CDC_TX_FULL;
     }
-    return err;
+    // zero copy transfer from cpu to usb hardware without TinyUSB TX FIFO
+    usbd_edpt_xfer(0, CDC_DATA_IN, (uint8_t*)buffer, size);
+    return CDC_ERR_OK;
+}   
+
+cdc_err_t cdc_write_bytes(uint8_t* buffer, size_t size) {
+    // claim endpoint before submtiting transfer
+    if (!usbd_edpt_claim(0, CDC_DATA_IN)) {
+        return CDC_TX_FULL;
+    }
+    // zero copy transfer from cpu to usb hardware without TinyUSB TX FIFO
+    usbd_edpt_xfer(0, CDC_DATA_IN, buffer, size);
+    return CDC_ERR_OK;
 }
 
-vendor_err_t vendor_write_to_linux(const char* buffer) {
-    uint32_t bytes_available = tud_vendor_n_write_available(0);
+vendor_err_t vendor_write_string(char* buffer) {
     size_t size = strlen(buffer);
-    if (bytes_available >= size) {
-        tud_vendor_n_write(0, buffer, size); 
-        uint32_t bytes_sent = tud_vendor_write_flush();
-        uint8_t out_buffer[64];
-        snprintf(out_buffer, "[DATA_SENT] Bytes sent: %lu\r\n", bytes_sent);
-        cdc_write_to_linux(out_buffer, strlen(out_buffer));
-        return OK;
-    } 
-    return TX_FULL;
+    // claim endpoint before submiting transfer
+    if (!usbd_edpt_claim(0, VENDOR_BULK_IN)) {
+        return VENDOR_TX_FULL;
+    }
+    // zero copy transfer from cpu to usb hardware without TinyUSB TX FIFO
+    usbd_edpt_xfer(0, VENDOR_BULK_IN, (uint8_t*)buffer, size);
+    char out_buffer[64];
+    snprintf(out_buffer, sizeof(out_buffer), "[DATA_SENT] %u Bytes sent\r\n", size);
+    cdc_write_string(out_buffer);
+    return VENDOR_ERR_OK;
+}   
+
+vendor_err_t vendor_write_bytes(uint8_t* buffer, size_t size) {
+    // claim endpoint before submtiting transfer
+    if (!usbd_edpt_claim(0, VENDOR_BULK_IN)) {
+        return VENDOR_TX_FULL;
+    }
+    // zero copy transfer from cpu to usb hardware without TinyUSB TX FIFO
+    usbd_edpt_xfer(0, VENDOR_BULK_IN, buffer, size);
+    char out_buffer[64];
+    snprintf(out_buffer, sizeof(out_buffer), "[DATA_SENT] %u Bytes sent\r\n", size);
+    cdc_write_string(out_buffer);
+    return VENDOR_ERR_OK;
 }   
 
 int uart_write_to_mcu(const char* string, size_t size) {
@@ -277,43 +307,43 @@ int uart_read_from_mcu(uint8_t* buffer, uint8_t max_length, uint8_t max_time_ms)
 }
 
 mcu_interface_err_t handle_identify() {
-    return vendor_write_to_linux("HANDLE IDENTIFY PLACEHOLDER\r\n") != ESP_OK? IDENTIFY : OK;
+    return vendor_write_string("HANDLE IDENTIFY PLACEHOLDER\r\n") != VENDOR_ERR_OK? IDENTIFY : MCU_INTERFACE_ERR_OK;
 }
 
 mcu_interface_err_t handle_get_status() {
-    return vendor_write_to_linux("HANDLE GET STATUS PLACEHOLDER\r\n") != ESP_OK? GET_STATUS : OK;
+    return vendor_write_string("HANDLE GET STATUS PLACEHOLDER\r\n") != VENDOR_ERR_OK? GET_STATUS : MCU_INTERFACE_ERR_OK;
 }
 
 mcu_interface_err_t handle_capture_state() {
-    return vendor_write_to_linux("HANDLE CAPUTURE STATE PLACEHOLDER\r\n") != ESP_OK? CAPTURE_STATE : OK;
+    return vendor_write_string("HANDLE CAPUTURE STATE PLACEHOLDER\r\n") != VENDOR_ERR_OK? CAPTURE_STATE : MCU_INTERFACE_ERR_OK;
 }
 
 mcu_interface_err_t handle_get_fault_context() {
-    return vendor_write_to_linux("HANDLE GET FAULT CONTEXT\r\n") != ESP_OK? GET_FAULT_CONTEXT : OK;
+    return vendor_write_string("HANDLE GET FAULT CONTEXT\r\n") != VENDOR_ERR_OK? GET_FAULT_CONTEXT : MCU_INTERFACE_ERR_OK;
 }
 
 mcu_interface_err_t handle_diagnose() {
-    return vendor_write_to_linux("HANDLE DIAGNOSE PLACEHOLDER\r\n") != ESP_OK? DIAGNOSE : OK;
+    return vendor_write_string("HANDLE DIAGNOSE PLACEHOLDER\r\n") != VENDOR_ERR_OK? DIAGNOSE : MCU_INTERFACE_ERR_OK;
 }   
 
 mcu_interface_err_t handle_verify_firmware() {
-    return vendor_write_to_linux("HANDLE VERIFY FIRMWARE PLACEHOLDER\r\n") != ESP_OK? VERIFY_FIRMWARE : OK;
+    return vendor_write_string("HANDLE VERIFY FIRMWARE PLACEHOLDER\r\n") != VENDOR_ERR_OK? VERIFY_FIRMWARE : MCU_INTERFACE_ERR_OK;
 }
 
 mcu_interface_err_t handle_reset_target() {
-    return vendor_write_to_linux("HANDLE RESET TARGET PLACEHOLDER\r\n") != ESP_OK? RESET_TARGET : OK;
+    return vendor_write_string("HANDLE RESET TARGET PLACEHOLDER\r\n") != VENDOR_ERR_OK? RESET_TARGET : MCU_INTERFACE_ERR_OK;
 }
 
 mcu_interface_err_t handle_enter_recovery() {
-    return vendor_write_to_linux("HANDLE ENTER RECOVERY PLACEHOLDER\r\n") != ESP_OK? ENTER_RECOVERY : OK;
+    return vendor_write_string("HANDLE ENTER RECOVERY PLACEHOLDER\r\n") != VENDOR_ERR_OK? ENTER_RECOVERY : MCU_INTERFACE_ERR_OK;
 }
 
 mcu_interface_err_t handle_recover_target() {
-    return vendor_write_to_linux("HANDLE RECOVER TARGET PLACEHOLDER\r\n") != ESP_OK? RECOVER_TARGET : OK;
+    return vendor_write_string("HANDLE RECOVER TARGET PLACEHOLDER\r\n") != VENDOR_ERR_OK? RECOVER_TARGET : MCU_INTERFACE_ERR_OK;
 }
 
 mcu_interface_err_t handle_generate_report() {
-    return vendor_write_to_linux("HANDLE GENERATE REPORT PLACEHOLDER\r\n") != ESP_OK? GENERATE_REPORT : OK;
+    return vendor_write_string("HANDLE GENERATE REPORT PLACEHOLDER\r\n") != VENDOR_ERR_OK? GENERATE_REPORT : MCU_INTERFACE_ERR_OK;
 }
 
 /*  
@@ -339,7 +369,7 @@ void parse_vendor_commands(void *pvParams) {
     while (1) {
         xQueueReceive(vendor_queue, &payload, portMAX_DELAY);
         if (!strcmp((const char*)payload.buffer.vendor_data, "PING\r\n")) {
-            write_to_linux((const uint8_t*)"PONG\r\n", 7);
+            cdc_write_string("[DIAGNOSTIC ESP32-S3] PONG\r\n");
         } else if (!strcmp((const char*)payload.buffer.vendor_data, "IDENTIFY\r\n")) {
             err = handle_identify();
         } else if (!strcmp((const char*)payload.buffer.vendor_data, "GET STATUS\r\n"))  {
