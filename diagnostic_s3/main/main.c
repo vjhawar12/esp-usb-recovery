@@ -13,13 +13,20 @@
 #define RELEASE_NUM 0x0200
 #define LANG_ENG 0x0409
 #define CDC_INTERFACE_NUM 0
+#define VENDOR_INTERFACE_NUM 2
 // single endpoint for vendor: 9 bytes interface descriptor + 7 bytes OUT endpoint descriptor 
 #undef TUD_VENDOR_DESC_LEN
 #define TUD_VENDOR_DESC_LEN 16
 #define CONFIG_LEN (TUD_CDC_DESC_LEN + TUD_VENDOR_DESC_LEN + TUD_CONFIG_DESC_LEN)
-#define TUD_VENDOR_DESCRIPTOR_CUSTOM(_itfnum,_stridx,_epin,_epsize) \
-9, TUSB_DESC_INTERFACE, _itfnum, 0, 1, TUSB_CLASS_VENDOR_SPECIFIC, 0x00, 0x00, _stridx, \
-7, TUSB_DESC_ENDPOINT, _epin, TUSB_XFER_INTERRUPT, U16_TO_U8S_LE(_epsize), 10
+
+#define EP3_IN 0x80
+#define EP3_OUT 0x03
+
+// vendor interface with 2 endpoints, EP3 Bulk Out and EP3 Bulk In
+#define TUD_VENDOR_DESCRIPTOR_CUSTOM(_itfnum,_stridx,_epin,_epout,_epsize) \
+9, TUSB_DESC_INTERFACE, _itfnum, 0, 2, TUSB_CLASS_VENDOR_SPECIFIC, 0x00, 0x00, _stridx, \
+7, TUSB_DESC_ENDPOINT, _epin, TUSB_XFER_BULK, U16_TO_U8S_LE(_epsize), 10, \
+7, TUSB_DESC_ENDPOINT, _epout, TUSB_XFER_BULK, U16_TO_U8S_LE(_epsize), 10
 
 #define UART_TX 4
 #define UART_RX 5
@@ -102,10 +109,12 @@ const tusb_desc_device_t device = {
     .bNumConfigurations = 0x01
 };
 
+// defines interface numbers, endpoints, etc
 uint8_t full_speed_config[] = {
+    // config num = 1; num interfaces = 3
     TUD_CONFIG_DESCRIPTOR(1, 3, 4, CONFIG_LEN, 0, 100),
     TUD_CDC_DESCRIPTOR(CDC_INTERFACE_NUM, 5, 0x81, 8, 0x02, 0x82, 64),
-    TUD_VENDOR_DESCRIPTOR_CUSTOM(2, 6, 0x83, 64),
+    TUD_VENDOR_DESCRIPTOR_CUSTOM(VENDOR_INTERFACE_NUM, 6, EP3_IN, EP3_OUT, 64),
 }; 
 
 /* 
@@ -163,6 +172,7 @@ void usb_init() {
         .event_cb = event_cb,
         .event_arg = NULL
     };
+    //  initialize the entire USB subsystem on the chip.
     ESP_ERROR_CHECK(tinyusb_driver_install(&config)); 
 }
 
@@ -191,7 +201,7 @@ void tinyusb_cdc_rx_callback(int itf, cdcacm_event_t *event) {
         payload_t payload;
         size_t num_bytes_read;
         payload.type = CDC;
-        tinyusb_cdcacm_read(CDC_INTERFACE_NUM, payload.buffer.cdc_data, sizeof(payload.length) - 1, &num_bytes_read); 
+        tinyusb_cdcacm_read(CDC_INTERFACE_NUM, payload.buffer.cdc_data, sizeof(payload.buffer.cdc_data), &num_bytes_read); 
         payload.buffer.cdc_data[num_bytes_read] = 0; 
         payload.length = num_bytes_read;  
         xQueueSend(cdc_queue, &payload, 0);
@@ -311,27 +321,27 @@ void parse_vendor_commands(void *pvParams) {
     mcu_interface_err_t err;
     while (1) {
         xQueueReceive(vendor_queue, &payload, portMAX_DELAY);
-        if (!strncmp((const char*)payload.buffer.vendor_data, "PING\r\n", 7)) {
+        if (!strcmp((const char*)payload.buffer.vendor_data, "PING\r\n")) {
             write_to_linux((const uint8_t*)"PONG\r\n", 7);
-        } else if (!strncmp((const char*)payload.buffer.vendor_data, "IDENTIFY\r\n", 11)) {
+        } else if (!strcmp((const char*)payload.buffer.vendor_data, "IDENTIFY\r\n")) {
             err = handle_identify();
-        } else if (!strncmp((const char*)payload.buffer.vendor_data, "GET STATUS\r\n", 13))  {
+        } else if (!strcmp((const char*)payload.buffer.vendor_data, "GET STATUS\r\n"))  {
             err = handle_get_status();
-        } else if (!strncmp((const char*)payload.buffer.vendor_data, "CAPTURE STATE\r\n", 16)) {
+        } else if (!strcmp((const char*)payload.buffer.vendor_data, "CAPTURE STATE\r\n")) {
             err = handle_capture_state();
-        } else if (!strncmp((const char*)payload.buffer.vendor_data, "GET FAULT CONTEXT\r\n", 20)) { 
+        } else if (!strcmp((const char*)payload.buffer.vendor_data, "GET FAULT CONTEXT\r\n")) { 
             err = handle_get_fault_context();
-        } else if (!strncmp((const char*)payload.buffer.vendor_data, "DIAGNOSE\r\n", 11)) { 
+        } else if (!strcmp((const char*)payload.buffer.vendor_data, "DIAGNOSE\r\n")) { 
             err = handle_diagnose();
-        } else if (!strncmp((const char*)payload.buffer.vendor_data, "VERIFY FIRMWARE\r\n", 18)) { 
+        } else if (!strcmp((const char*)payload.buffer.vendor_data, "VERIFY FIRMWARE\r\n")) { 
             err = handle_verify_firmware();
-        } else if (!strncmp((const char*)payload.buffer.vendor_data, "RESET TARGET\r\n", 15)) {
+        } else if (!strcmp((const char*)payload.buffer.vendor_data, "RESET TARGET\r\n")) {
             err = handle_reset_target();
-        } else if (!strncmp((const char*)payload.buffer.vendor_data, "ENTER RECOVERY\r\n", 17)) { 
+        } else if (!strcmp((const char*)payload.buffer.vendor_data, "ENTER RECOVERY\r\n")) { 
             err = handle_enter_recovery();
-        } else if (!strncmp((const char*)payload.buffer.vendor_data, "RECOVER TARGET\r\n", 17)) { 
+        } else if (!strcmp((const char*)payload.buffer.vendor_data, "RECOVER TARGET\r\n")) { 
             err = handle_recover_target();
-        } else if (!strncmp((const char*)payload.buffer.vendor_data, "GENERATE REPORT\r\n", 18)) { 
+        } else if (!strcmp((const char*)payload.buffer.vendor_data, "GENERATE REPORT\r\n")) { 
             err = handle_generate_report();
         } else {
             
@@ -361,7 +371,6 @@ void app_main(void) {
     uart_init();
     register_callbacks();
     xTaskCreate(parse_vendor_commands, "Parse Vendor Commands Task", 512, NULL, 5, NULL);
-    vTaskStartScheduler();
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(100));
     }
