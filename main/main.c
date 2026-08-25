@@ -6,7 +6,6 @@
 #include "esp_err.h"
 #include "esp_log.h"
 #include "driver/uart.h"
-//#include "tusb_config.h"
 #include "device/usbd_pvt.h"
 
 #define TAG "Diagnostic ESP32-S3"
@@ -41,8 +40,14 @@
 #define UART_DSR 9
 #define UART_NUM UART_NUM_2
 
-#define VENDOR_MAX_BUFFER_SIZE 64
+#define VENDOR_MAX_BUFFER_SIZE 2048
+#define MAX_IN_PACKET_SIZE 64
+#define MAX_OUT_PACKET_SIZE 64
 #define CDC_MAX_BUFFER_SIZE 64
+
+#define VENDOR_INTERFACE_CLASS 0xFF
+#define VENDOR_INTERFACE_SUBCLASS 0
+#define VENDOR_INTERFACE_PROTOCOL 0
 
 typedef enum connection_status_t {
     DISCONNECTED,   
@@ -64,6 +69,7 @@ typedef enum vendor_err_t {
 typedef enum cdc_err_t {
     CDC_ERR_OK,
     CDC_TX_FULL,
+    CDC_ERR_UNKNOWN
 } cdc_err_t;
 
 typedef struct payload_t {
@@ -89,12 +95,112 @@ typedef enum mcu_interface_err_t {
     GENERATE_REPORT
 } mcu_interface_err_t;
 
+typedef struct {
+  uint8_t itf_num; // interface number
+  uint8_t ep_addr_out, ep_addr_in; // addresses of endpoints
+  uint16_t max_in_packet_size, max_out_packet_size; // max packet sizes for each out/in packet
+  uint8_t* out_buff; // points to the physical usb packet from host -> device
+  uint8_t* in_buff; // points to the physical usb packet from device -> host
+  uint8_t rhport; // root hub usb controller port (should be 0 for single usb controller chips)
+  OSAL_MUTEX_DEF(mutexdef); // synchronization mechanism
+} recovery_vendor_interface_t; 
+
+static recovery_vendor_interface_t vendor_interface;
+
+void recovery_vendor_init(void) {
+    memset((&vendor_interface), 0, (sizeof(vendor_interface)));
+}
+
+bool recovery_vendor_deinit(void) {
+    return true;
+}
+
+void recovery_vendor_reset(uint8_t rhport) {
+    (void) rhport;
+    memset((&vendor_interface), 0, (sizeof(vendor_interface)));
+}
+
+/* 
+Claim the interface
+Identify/validate Recovery v1
+Walk the descriptors belonging to that interface
+Find the endpoints
+Validate the endpoint topology
+Open the endpoints in TinyUSB
+Save the live interface state
+Arm the OUT endpoint
+ Return how many descriptor bytes were consumed
+*/
+uint16_t recovery_vendor_open(uint8_t rhport, const tusb_desc_interface_t *desc_itf, uint16_t max_len) {
+    // validate interface class, subclass, protocol
+    TU_VERIFY(desc_itf->bInterfaceClass == VENDOR_INTERFACE_CLASS, 0); 
+    TU_VERIFY(desc_itf->bInterfaceSubClass == VENDOR_INTERFACE_SUBCLASS, 0); 
+    TU_VERIFY(desc_itf->bInterfaceProtocol == VENDOR_INTERFACE_PROTOCOL, 0);
+    // validate interface topology: 1 interface with 1 bulk in, 1 bulk out, no alternate settings
+    TU_VERIFY(desc_itf->bNumEndpoints == 2, 0); 
+    TU_VERIFY(desc_itf->bAlternateSetting == 0, 0); 
+    const uint8_t* desc_end = (const uint8_t*)desc_itf + max_len; // end of descriptor region available to this open() call
+    const uint8_t* p_desc = tu_desc_next(desc_itf); // point to endpoint descriptor
+    int bulk_endpoint_in_count = 0;
+    int bulk_endpoint_out_count = 0;
+    const tusb_desc_endpoint_t* desc_in_ep;
+    const tusb_desc_endpoint_t* desc_out_ep; 
+    uint16_t in_size = 0;
+    uint16_t out_size = 0;
+    while (tu_desc_in_bounds(p_desc, desc_end)) { // looping per descriptor (interface, endpoint 1, endpoint 2)
+        const uint8_t desc_type = tu_desc_type(p_desc); // get descriptor type
+        if (desc_type == TUSB_DESC_INTERFACE || desc_type == TUSB_DESC_INTERFACE_ASSOCIATION) {
+            break; // end of this interface
+        } else if (desc_type == TUSB_DESC_ENDPOINT) {
+            desc_in_ep = (const tusb_desc_endpoint_t*) p_desc;
+            TU_VERIFY(desc_in_ep->bmAttributes.xfer == TUSB_XFER_BULK, 0);
+            if (tu_edpt_dir(desc_in_ep->bEndpointAddress) == TUSB_DIR_IN) {
+                bulk_endpoint_in_count++;
+                TU_VERIFY(bulk_endpoint_in_count == 1, 0);
+                in_size = tu_edpt_packet_size(desc_in_ep);
+                TU_VERIFY(in_size <= MAX_IN_PACKET_SIZE, 0);
+            } else {
+                bulk_endpoint_out_count++;
+                TU_VERIFY(bulk_endpoint_out_count == 1, 0);
+                out_size = tu_edpt_packet_size(desc_out_ep);
+                TU_VERIFY(out_size <= MAX_OUT_PACKET_SIZE, 0);
+            }
+        }
+        p_desc = tu_desc_next(p_desc);
+    }
+    TU_VERIFY(bulk_endpoint_in_count == 1);
+    TU_VERIFY(bulk_endpoint_out_count == 1);
+    vendor_interface.itf_num = desc_itf->bInterfaceNumber;
+    vendor_interface.rhport = rhport;
+    vendor_interface.ep_addr_in  = desc_in_ep->bEndpointAddress;
+    vendor_interface.max_in_packet_size = in_size;
+    vendor_interface.ep_addr_out = desc_out_ep->bEndpointAddress;
+    vendor_interface.max_out_packet_size = out_size;
+    TU_VERIFY(usbd_edpt_open(rhport, desc_in_ep), 0);
+    TU_VERIFY(usbd_edpt_open(rhport, desc_out_ep), 0);
+    // Prepare for incoming data
+    TU_VERIFY(usbd_edpt_xfer(rhport, vendor_interface.ep_addr_out, vendor_interface.out_buff, vendor_interface.max_out_packet_size), 0);
+    return (uint16_t)((uintptr_t)p_desc - (uintptr_t)desc_itf);
+}
+
+static usbd_class_driver_t const recovery_vendor_driver = {
+    .name             = "VENDOR",
+    .init             = recovery_vendor_init, // called once at system boot to initialize variables
+    .deinit           = recovery_vendor_deinit, // called when stack tear down (deep sleep, reboot, etc)
+    .reset            = recovery_vendor_reset, // called when USB bus reset triggered
+    .open             = recovery_vendor_open, // called once during USB enumeration to arm the DMA transfer
+    .control_xfer_cb  = tud_vendor_control_xfer_cb, // called when vendor specific control transfer arrives on EP 0
+    .xfer_cb          = vendord_xfer_cb, // called everytime a data transfer completes 
+    .xfer_isr         = NULL,
+    .sof              = NULL
+}; 
+
 connection_status_t conn_status;
 QueueHandle_t cdc_queue, vendor_queue, uart_queue; // event queue for UART controller to transmit to CPU
 
 const char* string_desc[] = {
     (const char[]) { 0x09, 0x04 }, // english only
-    "Taylor Systems Engineering",
+    "Taylor Systems Engineering",   
     "Secondary Module Recovery Device",
     "123", // change serial number later
     "CDC and Vendor configuration",
@@ -127,14 +233,40 @@ uint8_t full_speed_config[] = {
 }; 
 
 /* 
-endpoint 0: device control endpoint
-CDC: requires 3 endpoint lanes: notification, data in, data out
-EP1 In: interrupt; 
-EP2 In: bulk
-EP2 OUT: bulk
+ ==============================================================================
+ USB HARDWARE ENDPOINT LAYOUT & LANE ALLOCATION
+ ==============================================================================
+ Note: Each physical Endpoint (EP) index contains two independent hardware lanes:
+   - OUT Lane (Host -> Device / RX) : Address = 0x0X (Bit 7 = 0)
+   - IN  Lane (Device -> Host / TX) : Address = 0x8X (Bit 7 = 1)
+ ------------------------------------------------------------------------------
 
-Vendor:
-EP3 In: interrupt
+ [EP0] - Default Control Endpoint (Shared Bidirectional Pipe)
+   ├─ OUT Lane (0x00) : Control Engine (SETUP & OUT Data Stage)
+   └─ IN  Lane (0x80) : Control Engine (IN Data & STATUS Stage)
+
+ ------------------------------------------------------------------------------
+ [EP1] - CDC Management / Notification Interface
+   ├─ OUT Lane (0x01) : Unused / Unassigned in Hardware
+   └─ IN  Lane (0x81) : Interrupt EP1 IN FIFO (Device -> Host Notifications)
+
+ ------------------------------------------------------------------------------
+ [EP2] - CDC Data Interface
+   ├─ OUT Lane (0x02) : Bulk EP2 OUT Hardware FIFO (Host -> Device RX Data)
+   └─ IN  Lane (0x82) : Bulk EP2 IN Hardware FIFO  (Device -> Host TX Data)
+
+ ------------------------------------------------------------------------------
+ [EP3] - Vendor Custom Class Interface
+   ├─ OUT Lane (0x03) : Bulk EP3 OUT Hardware FIFO (Host -> Device RX Stream)
+   └─ IN  Lane (0x83) : Bulk EP3 IN Hardware FIFO  (Device -> Host TX Stream)
+
+ ==============================================================================
+ HARDWARE SUMMARY FOR CONSUMED LANES:
+   - EP0 : 1 Bidirectional Pipe (0x00 / 0x80) (itf 0)
+   - EP1 : 1 IN Lane (0x81) (itf 1)
+   - EP2 : 1 OUT Lane (0x02) + 1 IN Lane (0x82) (itf 1)
+   - EP3 : 1 OUT Lane (0x03) + 1 IN Lane (0x83) (itf 2)
+ ==============================================================================
 */
 
 const tinyusb_desc_config_t descriptor = {
@@ -231,7 +363,7 @@ ENTER_RECOVERY
 RECOVER_TARGET
 GENERATE_REPORT
 */
-void tud_vendor_rx_cb(uint8_t idx, const uint8_t *buffer, uint16_t bufsize) {
+void recovery_tud_vendor_rx_cb(uint8_t idx, const uint8_t *buffer, uint16_t bufsize) {
     if (idx == 0) {
         payload_t payload;
         payload.type = VENDOR;
@@ -243,25 +375,29 @@ void tud_vendor_rx_cb(uint8_t idx, const uint8_t *buffer, uint16_t bufsize) {
     }
 }
 
-
 cdc_err_t cdc_write_string(char* buffer) {
     size_t size = strlen(buffer);
-    // claim endpoint before submiting transfer
-    if (!usbd_edpt_claim(0, CDC_DATA_IN)) {
+    uint32_t bytes_available = tud_cdc_write_available(); 
+    if (bytes_available < size) {
         return CDC_TX_FULL;
     }
-    // zero copy transfer from cpu to usb hardware without TinyUSB TX FIFO
-    usbd_edpt_xfer(0, CDC_DATA_IN, (uint8_t*)buffer, size);
+    size_t bytes_written = tinyusb_cdcacm_write_queue(CDC_INTERFACE_NUM, (uint8_t*)buffer, size);
+    tinyusb_cdcacm_write_flush(CDC_INTERFACE_NUM, 0);
+    if (bytes_written != size) {
+        return CDC_ERR_UNKNOWN;
+    }
     return CDC_ERR_OK;
 }   
 
 cdc_err_t cdc_write_bytes(uint8_t* buffer, size_t size) {
-    // claim endpoint before submtiting transfer
-    if (!usbd_edpt_claim(0, CDC_DATA_IN)) {
+    uint32_t bytes_available = tud_cdc_write_available(); 
+    if (bytes_available < size) {
         return CDC_TX_FULL;
     }
-    // zero copy transfer from cpu to usb hardware without TinyUSB TX FIFO
-    usbd_edpt_xfer(0, CDC_DATA_IN, buffer, size);
+    size_t bytes_written = tinyusb_cdcacm_write_queue(CDC_INTERFACE_NUM, (uint8_t*)buffer, size);
+    if (bytes_written != size) {
+        return CDC_ERR_UNKNOWN;
+    }
     return CDC_ERR_OK;
 }
 
@@ -275,7 +411,7 @@ vendor_err_t vendor_write_string(char* buffer) {
     usbd_edpt_xfer(0, VENDOR_BULK_IN, (uint8_t*)buffer, size);
     char out_buffer[64];
     snprintf(out_buffer, sizeof(out_buffer), "[DATA_SENT] %u Bytes sent\r\n", size);
-    cdc_write_string(out_buffer);
+    cdc_write_string(out_buffer);   
     return VENDOR_ERR_OK;
 }   
 
