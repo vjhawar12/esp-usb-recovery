@@ -55,7 +55,6 @@ void recovery_vendor_reset(uint8_t rhport);
 uint16_t recovery_vendor_open(uint8_t rhport, const tusb_desc_interface_t *desc_itf, uint16_t max_len);
 bool recovery_vendor_control_completed_cb(uint8_t rhport, uint8_t stage, tusb_control_request_t const* request);
 bool recovery_vendor_data_completed_cb(uint8_t rhport, uint8_t ep_addr, xfer_result_t result, uint32_t xferred_bytes);
-void recovery_tud_vendor_rx_cb(uint8_t idx, const uint8_t *buffer, uint16_t bufsize);
 
 typedef enum connection_status_t {
     DISCONNECTED,   
@@ -108,8 +107,8 @@ typedef struct {
   uint8_t ep_addr_out, ep_addr_in; // addresses of endpoints
   uint16_t max_in_packet_size, max_out_packet_size; // max packet sizes for each out/in packet
   uint8_t rhport; // root hub usb controller port (should be 0 for single usb controller chips)
-  bool tx_busy;
-  bool rx_busy;
+  bool tx_done;
+  bool rx_done;
 } recovery_vendor_interface_t; 
 
 CFG_TUSB_MEM_ALIGN
@@ -117,6 +116,27 @@ static uint8_t in_buff[VENDOR_MAX_BUFFER_SIZE] = {0};  // points to the physical
 CFG_TUSB_MEM_ALIGN
 static uint8_t out_buff[VENDOR_MAX_BUFFER_SIZE] = {0};  // points to the physical usb packet from host -> device
 static recovery_vendor_interface_t vendor_interface;
+
+/* 
+RX Path: 
+
+open()
+ ↓
+arm out_buff
+ ↓
+[Linux sends]
+ ↓
+hardware fills out_buff
+ ↓
+xfer_cb()
+ ↓
+copy/enqueue out_buff
+ ↓
+re-arm out_buff
+ ↓
+[wait for next Linux packet]
+*/
+
 static usbd_class_driver_t const recovery_vendor_driver = {
     .name             = "VENDOR",
     .init             = recovery_vendor_init, // called once at system boot to initialize variables
@@ -165,8 +185,6 @@ uint8_t full_speed_config[] = {
 
 connection_status_t conn_status;
 QueueHandle_t cdc_queue, vendor_queue, uart_queue; // event queue for UART controller to transmit to CPU
-
-
 
 /* 
  ==============================================================================
@@ -236,6 +254,15 @@ void recovery_vendor_reset(uint8_t rhport) {
     memset(out_buff, 0, sizeof(out_buff)); 
 }
 
+
+static inline void arm_rx(uint8_t rhport) {
+    TU_VERIFY(usbd_edpt_xfer(rhport, vendor_interface.ep_addr_out, out_buff, vendor_interface.max_out_packet_size), 0);
+}
+
+static inline void arm_tx(uint8_t rhport) {
+    TU_VERIFY(usbd_edpt_xfer(rhport, vendor_interface.ep_addr_in, in_buff, vendor_interface.max_in_packet_size), 0);
+}
+
 /* 
 Claim the interface
 Identify/validate Recovery v1
@@ -298,8 +325,8 @@ uint16_t recovery_vendor_open(uint8_t rhport, const tusb_desc_interface_t *desc_
     vendor_interface.max_out_packet_size = out_size;
     TU_VERIFY(usbd_edpt_open(rhport, desc_in_ep), 0);
     TU_VERIFY(usbd_edpt_open(rhport, desc_out_ep), 0);
-    // Prepare for incoming data
-    TU_VERIFY(usbd_edpt_xfer(rhport, vendor_interface.ep_addr_out, out_buff, vendor_interface.max_out_packet_size), 0);
+    // arming the USB peripheral so it can accept incoming packets
+    arm_rx(rhport); 
     return (uint16_t)((uintptr_t)p_desc - (uintptr_t)desc_itf);
 }
 
@@ -308,14 +335,23 @@ bool recovery_vendor_control_completed_cb(uint8_t rhport, uint8_t stage, tusb_co
     return false;
 }
 
+// runs when data (interrupt/bulk) transfer finishes on an endpoint. This could be OUT/RX or IN/TX.  
 bool recovery_vendor_data_completed_cb(uint8_t rhport, uint8_t ep_addr, xfer_result_t result, uint32_t xferred_bytes) {
     (void) result;
     TU_VERIFY(ep_addr == vendor_interface.ep_addr_in || ep_addr == vendor_interface.ep_addr_out, 0);
     if (ep_addr == vendor_interface.ep_addr_in) {
-        vendor_interface.rx_busy = false;
-        recovery_tud_vendor_rx_cb(0, in_buff, xferred_bytes);
+        vendor_interface.tx_done = true;
     } else {
-        vendor_interface.tx_busy = false;
+        vendor_interface.rx_done = true;
+        payload_t payload;
+        payload.type = VENDOR;
+        if (xferred_bytes > VENDOR_MAX_BUFFER_SIZE) return;
+        memcpy(payload.buffer.vendor_data, out_buff, xferred_bytes);
+        payload.buffer.vendor_data[xferred_bytes] = 0; 
+        payload.length = xferred_bytes;  
+        xQueueSend(vendor_queue, &payload, 0);
+        // rearming the USB peripheral so it can accept the next packet
+        arm_rx(rhport);
     }
     return true;
 }
@@ -358,6 +394,15 @@ void usb_init() {
     };
     //  initialize the entire USB subsystem on the chip.
     ESP_ERROR_CHECK(tinyusb_driver_install(&config)); 
+
+    tinyusb_config_cdcacm_t acm_cfg = {
+        .cdc_port = TINYUSB_CDC_ACM_0,
+        .callback_rx = tinyusb_cdc_rx_callback, 
+        .callback_rx_wanted_char = NULL,
+        .callback_line_state_changed = NULL,
+        .callback_line_coding_changed = NULL
+    };
+    ESP_ERROR_CHECK(tinyusb_cdcacm_init(&acm_cfg));
 }
 
 void uart_init() {
@@ -392,32 +437,6 @@ void tinyusb_cdc_rx_callback(int itf, cdcacm_event_t *event) {
     } 
 }   
 
-// vendor equivalent of cdc rx callback
-/* 
-handles
-IDENTIFY
-GET_STATUS
-CAPTURE_STATE
-GET_FAULT_CONTEXT
-DIAGNOSE
-VERIFY_FIRMWARE
-RESET_TARGET
-ENTER_RECOVERY
-RECOVER_TARGET
-GENERATE_REPORT
-*/
-void recovery_tud_vendor_rx_cb(uint8_t idx, const uint8_t *buffer, uint16_t bufsize) {
-    if (idx == 0) {
-        payload_t payload;
-        payload.type = VENDOR;
-        if (bufsize > VENDOR_MAX_BUFFER_SIZE) return;
-        memcpy(payload.buffer.vendor_data, buffer, bufsize * sizeof(uint8_t));
-        payload.buffer.vendor_data[bufsize] = 0; 
-        payload.length = bufsize;  
-        xQueueSend(vendor_queue, &payload, 0);
-    }
-}
-
 cdc_err_t cdc_write_string(char* buffer) {
     size_t size = strlen(buffer);
     uint32_t bytes_available = tud_cdc_write_available(); 
@@ -444,14 +463,27 @@ cdc_err_t cdc_write_bytes(uint8_t* buffer, size_t size) {
     return CDC_ERR_OK;
 }
 
-vendor_err_t vendor_write_string(char* buffer) {
-    size_t size = strlen(buffer);
-    // claim endpoint before submiting transfer
+// clear tx_done flag, fill buffer, arm hardware, wait for tx_done flag to be set by callback
+vendor_err_t vendor_write_string(char* buffer, uint32_t ticks_to_wait) {
+     // claim endpoint before submiting transfer
     if (!usbd_edpt_claim(0, VENDOR_BULK_IN)) {
         return VENDOR_TX_FULL;
     }
-    // zero copy transfer from cpu to usb hardware without TinyUSB TX FIFO
-    usbd_edpt_xfer(0, VENDOR_BULK_IN, (uint8_t*)buffer, size);
+    // clearing tx_done flag
+    vendor_interface.tx_done = false;
+    // filling buffer
+    size_t size = strlen(buffer);
+    memcpy(out_buff, buffer, size);
+    // arming hardwware
+    arm_tx(0); 
+    // waiting for tx_done to be set
+    TickType_t start_tick = xTaskGetTickCount();
+    while (!vendor_interface.tx_done) {
+        if (xTaskGetTickCount() - start_tick >= ticks_to_wait) {
+            break;
+        }
+    }
+    // logging via CDC
     char out_buffer[64];
     snprintf(out_buffer, sizeof(out_buffer), "[DATA_SENT] %u Bytes sent\r\n", size);
     cdc_write_string(out_buffer);   
@@ -575,17 +607,6 @@ void parse_vendor_commands(void *pvParams) {
     }       
 }
 
-void register_callbacks() {
-    tinyusb_config_cdcacm_t acm_cfg = {
-        .cdc_port = TINYUSB_CDC_ACM_0,
-        .callback_rx = tinyusb_cdc_rx_callback, 
-        .callback_rx_wanted_char = NULL,
-        .callback_line_state_changed = NULL,
-        .callback_line_coding_changed = NULL
-    };
-    ESP_ERROR_CHECK(tinyusb_cdcacm_init(&acm_cfg));
-}
-
 void freertos_init() {
     cdc_queue = xQueueCreate(5, sizeof(payload_t));
     vendor_queue = xQueueCreate(5, sizeof(payload_t));
@@ -595,7 +616,6 @@ void app_main(void) {
     freertos_init();
     usb_init();
     uart_init();
-    register_callbacks();
     xTaskCreate(parse_vendor_commands, "Parse Vendor Commands Task", 512, NULL, 5, NULL);
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(100));
