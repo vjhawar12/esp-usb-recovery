@@ -7,6 +7,7 @@
 #include "esp_log.h"
 #include "driver/uart.h"
 #include "device/usbd_pvt.h"
+#include "device/dcd.h"  
 
 #define TAG "Diagnostic ESP32-S3"
 #define LOG(msg) ESP_LOGW(TAG, msg)
@@ -56,11 +57,12 @@ uint16_t recovery_vendor_open(uint8_t rhport, const tusb_desc_interface_t *desc_
 bool recovery_vendor_control_completed_cb(uint8_t rhport, uint8_t stage, tusb_control_request_t const* request);
 bool recovery_vendor_data_completed_cb(uint8_t rhport, uint8_t ep_addr, xfer_result_t result, uint32_t xferred_bytes);
 
+// tracks USB connection state for logging
 typedef enum connection_status_t {
-    DISCONNECTED,   
-    MOUNTED,
-    SUSPENDED,
-    RESUMED
+    DISCONNECTED, // physical usb link is absent    
+    CONNECTED, // physical usb link detected, but kernel has not acknowledged yet
+    ENUMERATED, // connected and kernel has enumerated (acknowledged) the device a.k.a device mounted
+    SUSPENDED, // host has put bus in low power state / cable has temporarily lost host communication
 } connection_status_t;
 
 typedef enum payload_type_t {
@@ -107,8 +109,8 @@ typedef struct {
   uint8_t ep_addr_out, ep_addr_in; // addresses of endpoints
   uint16_t max_in_packet_size, max_out_packet_size; // max packet sizes for each out/in packet
   uint8_t rhport; // root hub usb controller port (should be 0 for single usb controller chips)
-  bool tx_done;
-  bool rx_done;
+  bool tx_done; // set when a single low-level USB transaction (host -> device) is completed 
+  bool rx_done; // set when a signle low-level USB transaction (device -> host) is completed
 } recovery_vendor_interface_t; 
 
 CFG_TUSB_MEM_ALIGN
@@ -254,7 +256,6 @@ void recovery_vendor_reset(uint8_t rhport) {
     memset(out_buff, 0, sizeof(out_buff)); 
 }
 
-
 static inline void arm_rx(uint8_t rhport) {
     TU_VERIFY(usbd_edpt_xfer(rhport, vendor_interface.ep_addr_out, out_buff, vendor_interface.max_out_packet_size), 0);
 }
@@ -356,40 +357,34 @@ bool recovery_vendor_data_completed_cb(uint8_t rhport, uint8_t ep_addr, xfer_res
     return true;
 }
 
-
 usbd_class_driver_t const* usbd_app_driver_get_cb(uint8_t* driver_count) {
     *driver_count = 1;
     return &recovery_vendor_driver;
 }
 
-// high level hook -- not critical for operation just keeping track of state
-void event_cb(tinyusb_event_t *event, void *arg) {
-    switch (event->id) {
-        case TINYUSB_EVENT_ATTACHED:
-            LOG("Attached: device connected to host; config complete");
-            conn_status = MOUNTED;
-            break;
-        case TINYUSB_EVENT_DETACHED:
-            LOG("Detached: device unplugged / disconnected from host");
+void tud_event_hook_cb(uint8_t rhport, uint32_t eventid, bool in_isr) {
+    switch (eventid) {
+        case DCD_EVENT_UNPLUGGED:
             conn_status = DISCONNECTED;
             break;
-        case TINYUSB_EVENT_SUSPENDED:
-            LOG("Suspended: host suspended the bus");
+        case DCD_EVENT_BUS_RESET:
+            conn_status = CONNECTED;
+            break;
+        case DCD_EVENT_SETUP_RECEIVED:
+            conn_status = ENUMERATED;
+            break;
+        case DCD_EVENT_SUSPEND:
             conn_status = SUSPENDED;
             break;
-        case TINYUSB_EVENT_RESUMED:
-            LOG("Resumed: host resumed the bus");
-            conn_status = RESUMED;
-            break;
     }
-} 
+}
 
 void usb_init() {
     const tinyusb_config_t config = {
         .descriptor = descriptor,
         .port = TINYUSB_PORT_FULL_SPEED_0,
         .phy = phy,
-        .event_cb = event_cb,
+        .event_cb = NULL,
         .event_arg = NULL
     };
     //  initialize the entire USB subsystem on the chip.
@@ -518,43 +513,43 @@ int uart_read_from_mcu(uint8_t* buffer, uint8_t max_length, uint8_t max_time_ms)
 }
 
 mcu_interface_err_t handle_identify() {
-    return vendor_write_string("HANDLE IDENTIFY PLACEHOLDER\r\n") != VENDOR_ERR_OK? IDENTIFY : MCU_INTERFACE_ERR_OK;
+    return vendor_write_string("HANDLE IDENTIFY PLACEHOLDER\r\n", pdMS_TO_TICKS(30)) != VENDOR_ERR_OK? IDENTIFY : MCU_INTERFACE_ERR_OK;
 }
 
 mcu_interface_err_t handle_get_status() {
-    return vendor_write_string("HANDLE GET STATUS PLACEHOLDER\r\n") != VENDOR_ERR_OK? GET_STATUS : MCU_INTERFACE_ERR_OK;
+    return vendor_write_string("HANDLE GET STATUS PLACEHOLDER\r\n", pdMS_TO_TICKS(30)) != VENDOR_ERR_OK? GET_STATUS : MCU_INTERFACE_ERR_OK;
 }
 
 mcu_interface_err_t handle_capture_state() {
-    return vendor_write_string("HANDLE CAPUTURE STATE PLACEHOLDER\r\n") != VENDOR_ERR_OK? CAPTURE_STATE : MCU_INTERFACE_ERR_OK;
+    return vendor_write_string("HANDLE CAPUTURE STATE PLACEHOLDER\r\n", pdMS_TO_TICKS(30)) != VENDOR_ERR_OK? CAPTURE_STATE : MCU_INTERFACE_ERR_OK;
 }
 
 mcu_interface_err_t handle_get_fault_context() {
-    return vendor_write_string("HANDLE GET FAULT CONTEXT\r\n") != VENDOR_ERR_OK? GET_FAULT_CONTEXT : MCU_INTERFACE_ERR_OK;
+    return vendor_write_string("HANDLE GET FAULT CONTEXT\r\n", pdMS_TO_TICKS(30)) != VENDOR_ERR_OK? GET_FAULT_CONTEXT : MCU_INTERFACE_ERR_OK;
 }
 
 mcu_interface_err_t handle_diagnose() {
-    return vendor_write_string("HANDLE DIAGNOSE PLACEHOLDER\r\n") != VENDOR_ERR_OK? DIAGNOSE : MCU_INTERFACE_ERR_OK;
+    return vendor_write_string("HANDLE DIAGNOSE PLACEHOLDER\r\n", pdMS_TO_TICKS(30)) != VENDOR_ERR_OK? DIAGNOSE : MCU_INTERFACE_ERR_OK;
 }   
 
 mcu_interface_err_t handle_verify_firmware() {
-    return vendor_write_string("HANDLE VERIFY FIRMWARE PLACEHOLDER\r\n") != VENDOR_ERR_OK? VERIFY_FIRMWARE : MCU_INTERFACE_ERR_OK;
+    return vendor_write_string("HANDLE VERIFY FIRMWARE PLACEHOLDER\r\n", pdMS_TO_TICKS(30)) != VENDOR_ERR_OK? VERIFY_FIRMWARE : MCU_INTERFACE_ERR_OK;
 }
 
 mcu_interface_err_t handle_reset_target() {
-    return vendor_write_string("HANDLE RESET TARGET PLACEHOLDER\r\n") != VENDOR_ERR_OK? RESET_TARGET : MCU_INTERFACE_ERR_OK;
+    return vendor_write_string("HANDLE RESET TARGET PLACEHOLDER\r\n", pdMS_TO_TICKS(30)) != VENDOR_ERR_OK? RESET_TARGET : MCU_INTERFACE_ERR_OK;
 }
 
 mcu_interface_err_t handle_enter_recovery() {
-    return vendor_write_string("HANDLE ENTER RECOVERY PLACEHOLDER\r\n") != VENDOR_ERR_OK? ENTER_RECOVERY : MCU_INTERFACE_ERR_OK;
+    return vendor_write_string("HANDLE ENTER RECOVERY PLACEHOLDER\r\n", pdMS_TO_TICKS(30)) != VENDOR_ERR_OK? ENTER_RECOVERY : MCU_INTERFACE_ERR_OK;
 }
 
 mcu_interface_err_t handle_recover_target() {
-    return vendor_write_string("HANDLE RECOVER TARGET PLACEHOLDER\r\n") != VENDOR_ERR_OK? RECOVER_TARGET : MCU_INTERFACE_ERR_OK;
+    return vendor_write_string("HANDLE RECOVER TARGET PLACEHOLDER\r\n", pdMS_TO_TICKS(30)) != VENDOR_ERR_OK? RECOVER_TARGET : MCU_INTERFACE_ERR_OK;
 }
 
 mcu_interface_err_t handle_generate_report() {
-    return vendor_write_string("HANDLE GENERATE REPORT PLACEHOLDER\r\n") != VENDOR_ERR_OK? GENERATE_REPORT : MCU_INTERFACE_ERR_OK;
+    return vendor_write_string("HANDLE GENERATE REPORT PLACEHOLDER\r\n", pdMS_TO_TICKS(30)) != VENDOR_ERR_OK? GENERATE_REPORT : MCU_INTERFACE_ERR_OK;
 }
 
 /*  
