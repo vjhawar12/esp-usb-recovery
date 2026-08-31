@@ -261,13 +261,15 @@ void recovery_vendor_reset(uint8_t rhport) {
 }
 
 // prepares the USB host to receive #vendor_interface.max_out_packet_size of data from device (rx transaction) 
-static inline void arm_rx(uint8_t rhport) {
-    TU_VERIFY(usbd_edpt_xfer(rhport, vendor_interface.ep_addr_out, out_buff, vendor_interface.max_out_packet_size), 0);
+static inline bool arm_rx(uint8_t rhport) {
+    TU_VERIFY(usbd_edpt_xfer(rhport, vendor_interface.ep_addr_out, out_buff, vendor_interface.max_out_packet_size));
+    return true;
 }
 
 // prepares the USB host to send #total_bytes bytes of data to device (tx transaction)
-static inline void arm_tx(uint8_t rhport, uint16_t total_bytes) {
-    TU_VERIFY(usbd_edpt_xfer(rhport, vendor_interface.ep_addr_in, in_buff, total_bytes), 0);
+static inline bool arm_tx(uint8_t rhport, uint16_t total_bytes) {
+    TU_VERIFY(usbd_edpt_xfer(rhport, vendor_interface.ep_addr_in, in_buff, total_bytes));
+    return true;
 }
 
 /* 
@@ -402,7 +404,7 @@ void usb_init() {
 
     tinyusb_config_cdcacm_t acm_cfg = {
         .cdc_port = TINYUSB_CDC_ACM_0,
-        .callback_rx = tinyusb_cdc_rx_callback, 
+        .callback_rx = NULL, 
         .callback_rx_wanted_char = NULL,
         .callback_line_state_changed = NULL,
         .callback_line_coding_changed = NULL
@@ -426,21 +428,7 @@ void uart_init() {
     // Configure UART parameters
     ESP_ERROR_CHECK(uart_param_config(uart_num, &uart_config));
     ESP_ERROR_CHECK(uart_set_pin(UART_NUM, UART_TX, UART_RX, UART_RTS, UART_CTS, UART_DTR, UART_DSR));
-}
-
-// when linux computer sends data to esp via cdc interface
-// sends live logs to linux 
-void tinyusb_cdc_rx_callback(int itf, cdcacm_event_t *event) {
-    if (itf == CDC_INTERFACE_NUM && event->type == CDC_EVENT_RX) {
-        payload_t payload;
-        size_t num_bytes_read;
-        payload.type = CDC;
-        tinyusb_cdcacm_read(CDC_INTERFACE_NUM, payload.buffer.cdc_data, sizeof(payload.buffer.cdc_data) - 1, &num_bytes_read); 
-        payload.buffer.cdc_data[num_bytes_read] = 0; 
-        payload.length = num_bytes_read;  
-        xQueueSend(cdc_queue, &payload, 0);
-    } 
-}   
+}  
 
 cdc_err_t cdc_write_string(char* buffer) {
     size_t size = strlen(buffer);
@@ -470,8 +458,8 @@ cdc_err_t cdc_write_bytes(uint8_t* buffer, size_t size) {
 
 // diagnostic ESP32-S3 (device) -> Linux host
 // clear tx_done flag, fill buffer, arm hardware, wait for tx_done flag to be set by callback
-// to write raw bytes (not string) a uint8_t* cast can be used
-vendor_err_t vendor_write(char* buffer, uint32_t ms) {
+// to write a string a cast can be used
+vendor_err_t vendor_write(uint8_t* buffer, uint32_t ms) {
      // claim endpoint before submiting transfer
     if (!usbd_edpt_claim(0, VENDOR_BULK_IN)) {
         return VENDOR_TX_FULL;
@@ -479,7 +467,7 @@ vendor_err_t vendor_write(char* buffer, uint32_t ms) {
     // clearing tx_done flag
     vendor_interface.tx_done = false;
     // filling buffer
-    size_t size = strlen(buffer);
+    size_t size = sizeof(buffer);
     memcpy(in_buff, buffer, size);
     // arming hardware
     arm_tx(0, size); 
@@ -507,43 +495,43 @@ int uart_read_from_mcu(uint8_t* buffer, uint8_t max_length, uint8_t max_time_ms)
 }
 
 mcu_interface_err_t handle_identify() {
-    return vendor_write("HANDLE IDENTIFY PLACEHOLDER\r\n", pdMS_TO_TICKS(30)) != VENDOR_ERR_OK? IDENTIFY : MCU_INTERFACE_ERR_OK;
+    return vendor_write((uint8_t*)"HANDLE IDENTIFY PLACEHOLDER\r\n", pdMS_TO_TICKS(30)) != VENDOR_ERR_OK? IDENTIFY : MCU_INTERFACE_ERR_OK;
 }
 
 mcu_interface_err_t handle_get_status() {
-    return vendor_write("HANDLE GET STATUS PLACEHOLDER\r\n", pdMS_TO_TICKS(30)) != VENDOR_ERR_OK? GET_STATUS : MCU_INTERFACE_ERR_OK;
+    return vendor_write((uint8_t*)"HANDLE GET STATUS PLACEHOLDER\r\n", pdMS_TO_TICKS(30)) != VENDOR_ERR_OK? GET_STATUS : MCU_INTERFACE_ERR_OK;
 }
 
 mcu_interface_err_t handle_capture_state() {
-    return vendor_write("HANDLE CAPTURE STATE PLACEHOLDER\r\n", pdMS_TO_TICKS(30)) != VENDOR_ERR_OK? CAPTURE_STATE : MCU_INTERFACE_ERR_OK;
+    return vendor_write((uint8_t*)"HANDLE CAPTURE STATE PLACEHOLDER\r\n", pdMS_TO_TICKS(30)) != VENDOR_ERR_OK? CAPTURE_STATE : MCU_INTERFACE_ERR_OK;
 }
 
 mcu_interface_err_t handle_get_fault_context() {
-    return vendor_write("HANDLE GET FAULT CONTEXT\r\n", pdMS_TO_TICKS(30)) != VENDOR_ERR_OK? GET_FAULT_CONTEXT : MCU_INTERFACE_ERR_OK;
+    return vendor_write((uint8_t*)"HANDLE GET FAULT CONTEXT\r\n", pdMS_TO_TICKS(30)) != VENDOR_ERR_OK? GET_FAULT_CONTEXT : MCU_INTERFACE_ERR_OK;
 }
 
 mcu_interface_err_t handle_diagnose() {
-    return vendor_write("HANDLE DIAGNOSE PLACEHOLDER\r\n", pdMS_TO_TICKS(30)) != VENDOR_ERR_OK? DIAGNOSE : MCU_INTERFACE_ERR_OK;
+    return vendor_write((uint8_t*)"HANDLE DIAGNOSE PLACEHOLDER\r\n", pdMS_TO_TICKS(30)) != VENDOR_ERR_OK? DIAGNOSE : MCU_INTERFACE_ERR_OK;
 }   
 
 mcu_interface_err_t handle_verify_firmware() {
-    return vendor_write("HANDLE VERIFY FIRMWARE PLACEHOLDER\r\n", pdMS_TO_TICKS(30)) != VENDOR_ERR_OK? VERIFY_FIRMWARE : MCU_INTERFACE_ERR_OK;
+    return vendor_write((uint8_t*)"HANDLE VERIFY FIRMWARE PLACEHOLDER\r\n", pdMS_TO_TICKS(30)) != VENDOR_ERR_OK? VERIFY_FIRMWARE : MCU_INTERFACE_ERR_OK;
 }
 
 mcu_interface_err_t handle_reset_target() {
-    return vendor_write("HANDLE RESET TARGET PLACEHOLDER\r\n", pdMS_TO_TICKS(30)) != VENDOR_ERR_OK? RESET_TARGET : MCU_INTERFACE_ERR_OK;
+    return vendor_write((uint8_t*)"HANDLE RESET TARGET PLACEHOLDER\r\n", pdMS_TO_TICKS(30)) != VENDOR_ERR_OK? RESET_TARGET : MCU_INTERFACE_ERR_OK;
 }
 
 mcu_interface_err_t handle_enter_recovery() {
-    return vendor_write("HANDLE ENTER RECOVERY PLACEHOLDER\r\n", pdMS_TO_TICKS(30)) != VENDOR_ERR_OK? ENTER_RECOVERY : MCU_INTERFACE_ERR_OK;
+    return vendor_write((uint8_t*)"HANDLE ENTER RECOVERY PLACEHOLDER\r\n", pdMS_TO_TICKS(30)) != VENDOR_ERR_OK? ENTER_RECOVERY : MCU_INTERFACE_ERR_OK;
 }
 
 mcu_interface_err_t handle_recover_target() {
-    return vendor_write("HANDLE RECOVER TARGET PLACEHOLDER\r\n", pdMS_TO_TICKS(30)) != VENDOR_ERR_OK? RECOVER_TARGET : MCU_INTERFACE_ERR_OK;
+    return vendor_write((uint8_t*)"HANDLE RECOVER TARGET PLACEHOLDER\r\n", pdMS_TO_TICKS(30)) != VENDOR_ERR_OK? RECOVER_TARGET : MCU_INTERFACE_ERR_OK;
 }
 
 mcu_interface_err_t handle_generate_report() {
-    return vendor_write("HANDLE GENERATE REPORT PLACEHOLDER\r\n", pdMS_TO_TICKS(30)) != VENDOR_ERR_OK? GENERATE_REPORT : MCU_INTERFACE_ERR_OK;
+    return vendor_write((uint8_t*)"HANDLE GENERATE REPORT PLACEHOLDER\r\n", pdMS_TO_TICKS(30)) != VENDOR_ERR_OK? GENERATE_REPORT : MCU_INTERFACE_ERR_OK;
 }
 
 /*  
@@ -591,6 +579,9 @@ void parse_vendor_commands(void *pvParams) {
         } else if (!strcmp((const char*)payload.buffer.vendor_data, "GENERATE REPORT\r\n")) { 
             err = handle_generate_report();
         } else {
+            
+        }
+        if (err != MCU_INTERFACE_ERR_OK) {
             
         }
     }       
