@@ -387,7 +387,13 @@ void tud_event_hook_cb(uint8_t rhport, uint32_t eventid, bool in_isr) {
     }
 }
 
-void tud_mount_cb() {
+/* 
+ensure tinyusb.c has the following: 
+__attribute__((weak)) void custom_tud_mount_cb() {} 
+and tud_mount_cb calls custom_tud_mount_cb at the end
+*/
+
+void custom_tud_mount_cb() {
     conn_status = ENUMERATED;
 }
 
@@ -582,7 +588,7 @@ void parse_vendor_commands(void *pvParams) {
             
         }
         if (err != MCU_INTERFACE_ERR_OK) {
-            
+
         }
     }       
 }
