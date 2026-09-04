@@ -116,7 +116,12 @@ typedef struct {
 CFG_TUSB_MEM_ALIGN
 static uint8_t in_buff[VENDOR_MAX_BUFFER_SIZE] = {0};  // points to the physical usb packet from device -> host
 CFG_TUSB_MEM_ALIGN
-static uint8_t out_buff[BUFFER_POOL_NUM][VENDOR_MAX_BUFFER_SIZE] = {0};  // points to the physical usb packet from host -> device
+typedef struct buffer_state {
+    uint8_t buff[VENDOR_MAX_BUFFER_SIZE];
+    bool free;
+} buffer_state;
+
+static buffer_state out_buff[BUFFER_POOL_NUM] = {0};  // points to the physical usb packet from host -> device
 static recovery_vendor_interface_t vendor_interface; // metadata + done flags for vendor interface 
 
 /* 
@@ -262,7 +267,15 @@ void recovery_vendor_reset(uint8_t rhport) {
 
 // prepares the USB host to receive #vendor_interface.max_out_packet_size of data from device (rx transaction) 
 static inline bool arm_rx(uint8_t rhport) {
-    TU_VERIFY(usbd_edpt_xfer(rhport, vendor_interface.ep_addr_out, out_buff[buff_count++ % BUFFER_POOL_NUM], vendor_interface.max_out_packet_size));
+    TickType_t start_ticks = xTaskGetTickCount();
+    do {
+        buff_count++;
+        buff_count %= BUFFER_POOL_NUM;
+        if (xTaskGetTickCount() - start_ticks < pdMS_TO_TICKS(500)) {
+            return false;
+        }
+    } while (!out_buff[buff_count].free);
+    TU_VERIFY(usbd_edpt_xfer(rhport, vendor_interface.ep_addr_out, out_buff[buff_count].buff, vendor_interface.max_out_packet_size));
     return true;
 }
 
@@ -360,8 +373,7 @@ bool recovery_vendor_data_completed_cb(uint8_t rhport, uint8_t ep_addr, xfer_res
         payload_t payload;
         payload.type = VENDOR;
         if (xferred_bytes > VENDOR_MAX_BUFFER_SIZE) return false;
-        payload.buffer = out_buff[buff_count]; 
-        // memcpy(payload.buffer.vendor_data, out_buff, xferred_bytes);
+        payload.buffer = out_buff[buff_count].buff;  
         payload.buffer[xferred_bytes] = 0; 
         payload.length = xferred_bytes;  
         TU_VERIFY(xQueueSend(vendor_queue, &payload, 0) == pdTRUE);
@@ -565,6 +577,7 @@ void parse_vendor_commands(void *pvParams) {
     mcu_interface_err_t err;
     while (1) {
         xQueueReceive(vendor_queue, &payload, portMAX_DELAY);
+        out_buff[buff_count].free = true;
         if (!strcmp((const char*)payload.buffer, "PING\r\n")) {
             cdc_write_string("[DIAGNOSTIC ESP32-S3] PONG\r\n");
         } else if (!strcmp((const char*)payload.buffer, "IDENTIFY\r\n")) {
