@@ -98,11 +98,6 @@ typedef enum mcu_interface_err_t {
     GENERATE_REPORT
 } mcu_interface_err_t;
 
-typedef struct payload_t {
-    uint8_t *buffer;
-    payload_type_t type;
-    size_t length;
-} payload_t;
 
 typedef struct {
   uint8_t itf_num; // interface number
@@ -116,13 +111,20 @@ typedef struct {
 CFG_TUSB_MEM_ALIGN
 static uint8_t in_buff[VENDOR_MAX_BUFFER_SIZE] = {0};  // points to the physical usb packet from device -> host
 CFG_TUSB_MEM_ALIGN
-typedef struct buffer_state {
+typedef struct vendor_payload_t {
+    bool occupied;
+    size_t length;
     uint8_t buff[VENDOR_MAX_BUFFER_SIZE];
-    bool free;
-} buffer_state;
+} vendor_payload_t;
 
-static buffer_state out_buff[BUFFER_POOL_NUM] = {0};  // points to the physical usb packet from host -> device
+static vendor_payload_t out_buff[BUFFER_POOL_NUM] = {0};  // points to the physical usb packet from host -> device
 static recovery_vendor_interface_t vendor_interface; // metadata + done flags for vendor interface 
+
+CFG_TUSB_MEM_ALIGN
+typedef struct cdc_payload_t {
+     uint8_t buff[CDC_MAX_BUFFER_SIZE];
+     size_t length;
+} cdc_payload_t;
 
 /* 
 RX Path: 
@@ -271,10 +273,11 @@ static inline bool arm_rx(uint8_t rhport) {
     do {
         buff_count++;
         buff_count %= BUFFER_POOL_NUM;
-        if (xTaskGetTickCount() - start_ticks < pdMS_TO_TICKS(500)) {
+        if (xTaskGetTickCount() - start_ticks > pdMS_TO_TICKS(500)) {
             return false;
         }
-    } while (!out_buff[buff_count].free);
+    } while (out_buff[buff_count].occupied);
+    out_buff[buff_count].occupied = true;
     TU_VERIFY(usbd_edpt_xfer(rhport, vendor_interface.ep_addr_out, out_buff[buff_count].buff, vendor_interface.max_out_packet_size));
     return true;
 }
@@ -370,13 +373,8 @@ bool recovery_vendor_data_completed_cb(uint8_t rhport, uint8_t ep_addr, xfer_res
     } else {
         // mark RX transfer done
         vendor_interface.rx_done = true;
-        payload_t payload;
-        payload.type = VENDOR;
         if (xferred_bytes > VENDOR_MAX_BUFFER_SIZE) return false;
-        payload.buffer = out_buff[buff_count].buff;  
-        payload.buffer[xferred_bytes] = 0; 
-        payload.length = xferred_bytes;  
-        TU_VERIFY(xQueueSend(vendor_queue, &payload, 0) == pdTRUE);
+        TU_VERIFY(xQueueSend(vendor_queue, &out_buff[buff_count], 0) == pdTRUE);
         // rearming the USB peripheral so it can accept the next packet
         arm_rx(rhport);
     }
@@ -573,32 +571,31 @@ mcu_interface_err_t handle_generate_report() {
 +--------------------+-------------------------------------------------------------------+------------------------------------+
 */
 void parse_vendor_commands(void *pvParams) {
-    payload_t payload;
+    vendor_payload_t payload;
     mcu_interface_err_t err;
     while (1) {
         xQueueReceive(vendor_queue, &payload, portMAX_DELAY);
-        out_buff[buff_count].free = true;
-        if (!strcmp((const char*)payload.buffer, "PING\r\n")) {
+        if (!strcmp((const char*)payload.buff, "PING\r\n")) {
             cdc_write_string("[DIAGNOSTIC ESP32-S3] PONG\r\n");
-        } else if (!strcmp((const char*)payload.buffer, "IDENTIFY\r\n")) {
+        } else if (!strcmp((const char*)payload.buff, "IDENTIFY\r\n")) {
             err = handle_identify();
-        } else if (!strcmp((const char*)payload.buffer, "GET STATUS\r\n"))  {
+        } else if (!strcmp((const char*)payload.buff, "GET STATUS\r\n"))  {
             err = handle_get_status();
-        } else if (!strcmp((const char*)payload.buffer, "CAPTURE STATE\r\n")) {
+        } else if (!strcmp((const char*)payload.buff, "CAPTURE STATE\r\n")) {
             err = handle_capture_state();
-        } else if (!strcmp((const char*)payload.buffer, "GET FAULT CONTEXT\r\n")) { 
+        } else if (!strcmp((const char*)payload.buff, "GET FAULT CONTEXT\r\n")) { 
             err = handle_get_fault_context();
-        } else if (!strcmp((const char*)payload.buffer, "DIAGNOSE\r\n")) { 
+        } else if (!strcmp((const char*)payload.buff, "DIAGNOSE\r\n")) { 
             err = handle_diagnose();
-        } else if (!strcmp((const char*)payload.buffer, "VERIFY FIRMWARE\r\n")) { 
+        } else if (!strcmp((const char*)payload.buff, "VERIFY FIRMWARE\r\n")) { 
             err = handle_verify_firmware();
-        } else if (!strcmp((const char*)payload.buffer, "RESET TARGET\r\n")) {
+        } else if (!strcmp((const char*)payload.buff, "RESET TARGET\r\n")) {
             err = handle_reset_target();
-        } else if (!strcmp((const char*)payload.buffer, "ENTER RECOVERY\r\n")) { 
+        } else if (!strcmp((const char*)payload.buff, "ENTER RECOVERY\r\n")) { 
             err = handle_enter_recovery();
-        } else if (!strcmp((const char*)payload.buffer, "RECOVER TARGET\r\n")) { 
+        } else if (!strcmp((const char*)payload.buff, "RECOVER TARGET\r\n")) { 
             err = handle_recover_target();
-        } else if (!strcmp((const char*)payload.buffer, "GENERATE REPORT\r\n")) { 
+        } else if (!strcmp((const char*)payload.buff, "GENERATE REPORT\r\n")) { 
             err = handle_generate_report();
         } else {
             
@@ -606,12 +603,13 @@ void parse_vendor_commands(void *pvParams) {
         if (err != MCU_INTERFACE_ERR_OK) {
 
         }
+	payload.occupied = false;
     }       
 }
 
 void freertos_init() {
-    cdc_queue = xQueueCreate(5, sizeof(payload_t));
-    vendor_queue = xQueueCreate(5, sizeof(payload_t));
+    cdc_queue = xQueueCreate(5, sizeof(cdc_payload_t));
+    vendor_queue = xQueueCreate(5, sizeof(vendor_payload_t));
 }
 
 void app_main(void) {
