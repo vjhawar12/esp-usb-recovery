@@ -220,7 +220,7 @@ TaskHandle_t my_task_handle;
    └─ IN  Lane (0x82) : Bulk EP2 IN Hardware FIFO  (Device -> Host TX Data)
 
  ------------------------------------------------------------------------------
- [EP3] - Vendor Custom Class Interface
+ [EP3] - Vendor Custom Class InteDIAGNOSTIC ESP32-S3]rface
    ├─ OUT Lane (0x03) : Bulk EP3 OUT Hardware FIFO (Host -> Device RX Stream)
    └─ IN  Lane (0x83) : Bulk EP3 IN Hardware FIFO  (Device -> Host TX Stream)
 
@@ -267,22 +267,22 @@ void recovery_vendor_reset(uint8_t rhport) {
 }
 
 // prepares the USB host to receive #vendor_interface.max_out_packet_size of data from device (rx transaction) 
-static inline bool arm_rx(uint8_t rhport) {
+bool arm_rx(uint8_t rhport) {
     TickType_t start_ticks = xTaskGetTickCount();
-    do {
-        buff_count++;
-        buff_count %= BUFFER_POOL_NUM;
-        if (xTaskGetTickCount() - start_ticks > pdMS_TO_TICKS(500)) {
-            return false;
+    int tries = 0;
+    for (tries = 0; tries < BUFFER_POOL_NUM; tries++) {
+        buff_count = (buff_count + 1) % BUFFER_POOL_NUM;
+        if (!out_buff[buff_count].occupied) {
+            TU_VERIFY(usbd_edpt_xfer(rhport, vendor_interface.ep_addr_out, out_buff[buff_count].buff, vendor_interface.max_out_packet_size));
+            out_buff[buff_count].occupied = true;
+            return true;
         }
-    } while (out_buff[buff_count].occupied);
-    out_buff[buff_count].occupied = true;
-    TU_VERIFY(usbd_edpt_xfer(rhport, vendor_interface.ep_addr_out, out_buff[buff_count].buff, vendor_interface.max_out_packet_size));
-    return true;
+    }
+    return false; 
 }
 
 // prepares the USB host to send #total_bytes bytes of data to device (tx transaction)
-static inline bool arm_tx(uint8_t rhport, uint16_t total_bytes) {
+bool arm_tx(uint8_t rhport, uint16_t total_bytes) {
     TU_VERIFY(usbd_edpt_xfer(rhport, vendor_interface.ep_addr_in, in_buff, total_bytes));
     return true;
 }
@@ -372,9 +372,11 @@ bool recovery_vendor_data_completed_cb(uint8_t rhport, uint8_t ep_addr, xfer_res
     } else {
         // mark RX transfer done
         vendor_interface.rx_done = true;
-        if (xferred_bytes > VENDOR_MAX_BUFFER_SIZE) return false;
+        if (xferred_bytes > VENDOR_MAX_BUFFER_SIZE - 1) return false;
         // queue a pointer to a vendor_payload_t which has the buffer rather than the full object
         vendor_payload_t *payload = &out_buff[buff_count]; // passing in address of the thing we want to send
+        payload->length = xferred_bytes;
+        payload->buff[xferred_bytes] = 0;
         TU_VERIFY(xQueueSend(vendor_queue, &payload, 0) == pdTRUE);
         // rearming the USB peripheral so it can accept the next packet
         arm_rx(rhport);
@@ -572,31 +574,31 @@ mcu_interface_err_t handle_generate_report() {
 +--------------------+-------------------------------------------------------------------+------------------------------------+
 */
 void parse_vendor_commands(void *pvParams) {
-    vendor_payload_t payload;
+    vendor_payload_t *payload;
     mcu_interface_err_t err;
     while (1) {
         xQueueReceive(vendor_queue, &payload, portMAX_DELAY);
-        if (!strcmp((const char*)payload.buff, "PING\r\n")) {
-            cdc_write_string("[DIAGNOSTIC ESP32-S3] PONG\r\n");
-        } else if (!strcmp((const char*)payload.buff, "IDENTIFY\r\n")) {
+        if (!strcmp((const char*)payload->buff, "PING\r\n")) {
+            cdc_write_string(TAG "PONG\r\n");
+        } else if (!strcmp((const char*)payload->buff, "IDENTIFY\r\n")) {
             err = handle_identify();
-        } else if (!strcmp((const char*)payload.buff, "GET STATUS\r\n"))  {
+        } else if (!strcmp((const char*)payload->buff, "GET STATUS\r\n"))  {
             err = handle_get_status();
-        } else if (!strcmp((const char*)payload.buff, "CAPTURE STATE\r\n")) {
+        } else if (!strcmp((const char*)payload->buff, "CAPTURE STATE\r\n")) {
             err = handle_capture_state();
-        } else if (!strcmp((const char*)payload.buff, "GET FAULT CONTEXT\r\n")) { 
+        } else if (!strcmp((const char*)payload->buff, "GET FAULT CONTEXT\r\n")) { 
             err = handle_get_fault_context();
-        } else if (!strcmp((const char*)payload.buff, "DIAGNOSE\r\n")) { 
+        } else if (!strcmp((const char*)payload->buff, "DIAGNOSE\r\n")) { 
             err = handle_diagnose();
-        } else if (!strcmp((const char*)payload.buff, "VERIFY FIRMWARE\r\n")) { 
+        } else if (!strcmp((const char*)payload->buff, "VERIFY FIRMWARE\r\n")) { 
             err = handle_verify_firmware();
-        } else if (!strcmp((const char*)payload.buff, "RESET TARGET\r\n")) {
+        } else if (!strcmp((const char*)payload->buff, "RESET TARGET\r\n")) {
             err = handle_reset_target();
-        } else if (!strcmp((const char*)payload.buff, "ENTER RECOVERY\r\n")) { 
+        } else if (!strcmp((const char*)payload->buff, "ENTER RECOVERY\r\n")) { 
             err = handle_enter_recovery();
-        } else if (!strcmp((const char*)payload.buff, "RECOVER TARGET\r\n")) { 
+        } else if (!strcmp((const char*)payload->buff, "RECOVER TARGET\r\n")) { 
             err = handle_recover_target();
-        } else if (!strcmp((const char*)payload.buff, "GENERATE REPORT\r\n")) { 
+        } else if (!strcmp((const char*)payload->buff, "GENERATE REPORT\r\n")) { 
             err = handle_generate_report();
         } else {
             
@@ -604,7 +606,7 @@ void parse_vendor_commands(void *pvParams) {
         if (err != MCU_INTERFACE_ERR_OK) {
 
         }
-	    payload.occupied = false;
+	    payload->occupied = false;
     }       
 }
 
