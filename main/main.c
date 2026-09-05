@@ -98,7 +98,6 @@ typedef enum mcu_interface_err_t {
     GENERATE_REPORT
 } mcu_interface_err_t;
 
-
 typedef struct {
   uint8_t itf_num; // interface number
   uint8_t ep_addr_out, ep_addr_in; // addresses of endpoints
@@ -111,13 +110,13 @@ typedef struct {
 CFG_TUSB_MEM_ALIGN
 static uint8_t in_buff[VENDOR_MAX_BUFFER_SIZE] = {0};  // points to the physical usb packet from device -> host
 CFG_TUSB_MEM_ALIGN
-typedef struct vendor_payload_t {
+typedef struct vendor_payload_t { // buffer + metadata like occupied and length
     bool occupied;
     size_t length;
     uint8_t buff[VENDOR_MAX_BUFFER_SIZE];
 } vendor_payload_t;
 
-static vendor_payload_t out_buff[BUFFER_POOL_NUM] = {0};  // points to the physical usb packet from host -> device
+static vendor_payload_t out_buff[BUFFER_POOL_NUM] = {0};  // buffer pool, each buffer points to the physical usb packet from host -> device
 static recovery_vendor_interface_t vendor_interface; // metadata + done flags for vendor interface 
 
 CFG_TUSB_MEM_ALIGN
@@ -374,7 +373,9 @@ bool recovery_vendor_data_completed_cb(uint8_t rhport, uint8_t ep_addr, xfer_res
         // mark RX transfer done
         vendor_interface.rx_done = true;
         if (xferred_bytes > VENDOR_MAX_BUFFER_SIZE) return false;
-        TU_VERIFY(xQueueSend(vendor_queue, &out_buff[buff_count], 0) == pdTRUE);
+        // queue a pointer to a vendor_payload_t which has the buffer rather than the full object
+        vendor_payload_t *payload = &out_buff[buff_count]; // passing in address of the thing we want to send
+        TU_VERIFY(xQueueSend(vendor_queue, &payload, 0) == pdTRUE);
         // rearming the USB peripheral so it can accept the next packet
         arm_rx(rhport);
     }
@@ -603,13 +604,13 @@ void parse_vendor_commands(void *pvParams) {
         if (err != MCU_INTERFACE_ERR_OK) {
 
         }
-	payload.occupied = false;
+	    payload.occupied = false;
     }       
 }
 
 void freertos_init() {
-    cdc_queue = xQueueCreate(5, sizeof(cdc_payload_t));
-    vendor_queue = xQueueCreate(5, sizeof(vendor_payload_t));
+    cdc_queue = xQueueCreate(5, sizeof(cdc_payload_t)); 
+    vendor_queue = xQueueCreate(5, sizeof(vendor_payload_t*)); // number of bytes to send: sizeof(vendor_payload_t*) bytes
 }
 
 void app_main(void) {
