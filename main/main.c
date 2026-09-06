@@ -79,6 +79,8 @@ typedef enum vendor_err_t {
     VENDOR_ERR_PACKET_SIZE_EXCEEDED,
     VENDOR_TX_FULL,
     VENDOR_TX_DCD_ERR,
+    VENDOR_TX_ENDPOINT_BUSY,
+    VENDOR_RX_ENDPOINT_BUSY,
     VENDOR_RX_DCD_ERR,
     VENDOR_INVALID_CMD,
     VENDOR_NO_BUFFER_FREE,
@@ -320,6 +322,7 @@ static void recovery_vendor_reset(uint8_t rhport) {
 // Never reuse an occupied buffer because the command task may still be
 // reading it through a queued pointer.
 vendor_err_t arm_rx(uint8_t rhport) {
+    TU_ASSERT(usbd_edpt_claim(vendor_interface.rhport, vendor_interface.ep_addr_in), VENDOR_RX_ENDPOINT_BUSY);
     for (int tries = 0; tries < BUFFER_POOL_NUM; tries++) {
         buff_count = (buff_count + 1) % BUFFER_POOL_NUM;
         if (out_buff[buff_count].state == BUFFER_FREE) {
@@ -338,6 +341,7 @@ vendor_err_t arm_rx(uint8_t rhport) {
 
 // prepares the USB host to send #total_bytes bytes of data to device (tx transaction)
 vendor_err_t arm_tx(uint8_t rhport, uint16_t total_bytes) {
+    TU_ASSERT(usbd_edpt_claim(vendor_interface.rhport, vendor_interface.ep_addr_in), VENDOR_TX_ENDPOINT_BUSY); 
     TU_ASSERT(usbd_edpt_xfer(vendor_interface.rhport, vendor_interface.ep_addr_in, in_buff, total_bytes), VENDOR_TX_DCD_ERR);
     return VENDOR_ERR_OK;
 }
@@ -716,7 +720,7 @@ static void parse_vendor_commands(void *pvParams) {
         }
         // Command processing is complete; USB may now reuse this pool buffer.
 	    payload->state = BUFFER_FREE;
-        if (RX_NO_BUFFER_FREE) {
+        if (rx_state == RX_NO_BUFFER_FREE) {
             arm_rx(vendor_interface.rhport);
         }
     }       
