@@ -51,6 +51,7 @@
 #define VENDOR_INTERFACE_PROTOCOL 0
 
 #define BUFFER_POOL_NUM 5
+#define MAX_RETRIES 100
 
 void recovery_vendor_init(void);
 bool recovery_vendor_deinit(void);
@@ -77,6 +78,7 @@ typedef enum vendor_err_t {
     VENDOR_ERR_OK,
     VENDOR_ERR_USB_DESC,
     VENDOR_ERR_PACKET_SIZE_EXCEEDED,
+    VENDOR_ERR_MAX_RETRIES_EXCEEDED,
     VENDOR_TX_FULL,
     VENDOR_TX_DCD_ERR,
     VENDOR_RX_DCD_ERR,
@@ -336,8 +338,11 @@ vendor_err_t arm_tx(uint8_t rhport, uint16_t total_bytes) {
     return VENDOR_ERR_OK;
 }
 
-// rx = 1 => rx; rx = 0 => tx
-void handle_failed_to_arm(int rx) {
+void handle_dcd_error() {
+
+}
+
+void handle_max_retries_exceeded() {
 
 }
 
@@ -353,6 +358,7 @@ Arm the OUT endpoint
 Return how many descriptor bytes were consumed
 */
 uint16_t recovery_vendor_open(uint8_t rhport, const tusb_desc_interface_t *desc_itf, uint16_t max_len) {
+    static int retries = 0;
     // validate interface class, subclass, protocol
     TU_ASSERT(desc_itf->bInterfaceClass == VENDOR_INTERFACE_CLASS, VENDOR_ERR_USB_DESC); 
     TU_ASSERT(desc_itf->bInterfaceSubClass == VENDOR_INTERFACE_SUBCLASS, VENDOR_ERR_USB_DESC); 
@@ -405,8 +411,20 @@ uint16_t recovery_vendor_open(uint8_t rhport, const tusb_desc_interface_t *desc_
     TU_ASSERT(usbd_edpt_open(rhport, desc_out_ep), VENDOR_ERR_USB_DESC);
     // arming the USB peripheral so it can accept incoming packets
     vendor_err_t armed = arm_rx(rhport);
-    if (armed != VENDOR_ERR_OK) {
-        handle_failed_to_arm(1);
+    switch (armed) {
+        case VENDOR_ERR_OK:
+            retries = 0;
+            break;
+        case VENDOR_NO_BUFFER_FREE:
+            retries++;
+        case VENDOR_RX_DCD_ERR:
+            retries++;
+            handle_dcd_error();
+        default:
+            break;
+    }
+    if (retries > MAX_RETRIES) {
+        handle_max_retries_exceeded();
     }
     return (uint16_t)((uintptr_t)p_desc - (uintptr_t)desc_itf);
 }
@@ -418,6 +436,7 @@ bool recovery_vendor_control_completed_cb(uint8_t rhport, uint8_t stage, tusb_co
 
 // runs when data (interrupt/bulk) transfer finishes on an endpoint. This could be OUT/RX or IN/TX.  
 bool recovery_vendor_data_completed_cb(uint8_t rhport, uint8_t ep_addr, xfer_result_t result, uint32_t xferred_bytes) {
+    static int retries = 0;
     if (result != XFER_RESULT_SUCCESS) {
         return false;
     }
@@ -440,8 +459,22 @@ bool recovery_vendor_data_completed_cb(uint8_t rhport, uint8_t ep_addr, xfer_res
         TU_VERIFY(xQueueSend(vendor_queue, &payload, 0) == pdTRUE);
         payload->state = BUFFER_QUEUED;
         // rearming the USB peripheral so it can accept the next packet
-        bool armed = arm_rx(rhport);
-        rx_state = armed? RX_ARMED :  RX_NO_BUFFER_FREE;
+        vendor_err_t armed = arm_rx(rhport);
+        switch (armed) {
+            case VENDOR_ERR_OK:
+                retries = 0;
+                break;
+            case VENDOR_NO_BUFFER_FREE:
+                retries++;
+            case VENDOR_RX_DCD_ERR:
+                retries++;
+                handle_dcd_error();
+            default:
+                break;
+        }
+        if (retries > MAX_RETRIES) {
+            handle_max_retries_exceeded();
+        }
     }
     return true;
 }
