@@ -77,7 +77,6 @@ typedef enum vendor_err_t {
     VENDOR_ERR_OK,
     VENDOR_ERR_USB_DESC,
     VENDOR_ERR_PACKET_SIZE_EXCEEDED,
-    VENDOR_ERR_MAX_RETRIES_EXCEEDED,
     VENDOR_TX_FULL,
     VENDOR_TX_DCD_ERR,
     VENDOR_RX_DCD_ERR,
@@ -324,7 +323,7 @@ vendor_err_t arm_rx(uint8_t rhport) {
     for (int tries = 0; tries < BUFFER_POOL_NUM; tries++) {
         buff_count = (buff_count + 1) % BUFFER_POOL_NUM;
         if (out_buff[buff_count].state == BUFFER_FREE) {
-            if (!usbd_edpt_xfer(rhport, vendor_interface.ep_addr_out, out_buff[buff_count].buff, vendor_interface.max_out_packet_size)) {
+            if (!usbd_edpt_xfer(vendor_interface.rhport, vendor_interface.ep_addr_out, out_buff[buff_count].buff, vendor_interface.max_out_packet_size)) {
                 rx_state = RX_IDLE;
                 return VENDOR_RX_DCD_ERR;
             }
@@ -339,7 +338,7 @@ vendor_err_t arm_rx(uint8_t rhport) {
 
 // prepares the USB host to send #total_bytes bytes of data to device (tx transaction)
 vendor_err_t arm_tx(uint8_t rhport, uint16_t total_bytes) {
-    TU_ASSERT(usbd_edpt_xfer(rhport, vendor_interface.ep_addr_in, in_buff, total_bytes), VENDOR_TX_DCD_ERR);
+    TU_ASSERT(usbd_edpt_xfer(vendor_interface.rhport, vendor_interface.ep_addr_in, in_buff, total_bytes), VENDOR_TX_DCD_ERR);
     return VENDOR_ERR_OK;
 }
 
@@ -406,15 +405,24 @@ uint16_t recovery_vendor_open(uint8_t rhport, const tusb_desc_interface_t *desc_
     TU_ASSERT(bulk_endpoint_in_count == 1, VENDOR_ERR_USB_DESC);
     TU_ASSERT(bulk_endpoint_out_count == 1, VENDOR_ERR_USB_DESC);
     vendor_interface.itf_num = desc_itf->bInterfaceNumber;
+    /* 
+        each usb controller would have 1-2 buses (for 3.0 its 2 buses) and each bus has a root hub attached to it 
+        i.e a rhport. individual devices attach on a roothub port
+
+        rhport variable identifies a physical root hub
+
+        an rhport is fixed throughout the duration of the firmware, assuming you don't unplug and replug the device into
+        a different port while the application is running 
+    */
     vendor_interface.rhport = rhport;
     vendor_interface.ep_addr_in  = desc_in_ep->bEndpointAddress;
     vendor_interface.max_in_packet_size = in_size;
     vendor_interface.ep_addr_out = desc_out_ep->bEndpointAddress;
     vendor_interface.max_out_packet_size = out_size;
-    TU_ASSERT(usbd_edpt_open(rhport, desc_in_ep), VENDOR_ERR_USB_DESC);
-    TU_ASSERT(usbd_edpt_open(rhport, desc_out_ep), VENDOR_ERR_USB_DESC);
+    TU_ASSERT(usbd_edpt_open(vendor_interface.rhport, desc_in_ep), VENDOR_ERR_USB_DESC);
+    TU_ASSERT(usbd_edpt_open(vendor_interface.rhport, desc_out_ep), VENDOR_ERR_USB_DESC);
     // arming the USB peripheral so it can accept incoming packets
-    vendor_err_t armed = arm_rx(rhport);
+    vendor_err_t armed = arm_rx(vendor_interface.rhport);
     switch (armed) {
         case VENDOR_ERR_OK:
             break;
@@ -458,7 +466,7 @@ bool recovery_vendor_data_completed_cb(uint8_t rhport, uint8_t ep_addr, xfer_res
         TU_VERIFY(xQueueSend(vendor_queue, &payload, 0) == pdTRUE);
         payload->state = BUFFER_QUEUED;
         // rearming the USB peripheral so it can accept the next packet
-        vendor_err_t armed = arm_rx(rhport);
+        vendor_err_t armed = arm_rx(vendor_interface.rhport);
         switch (armed) {
             case VENDOR_ERR_OK:
                 break;
@@ -708,6 +716,9 @@ static void parse_vendor_commands(void *pvParams) {
         }
         // Command processing is complete; USB may now reuse this pool buffer.
 	    payload->state = BUFFER_FREE;
+        if (RX_NO_BUFFER_FREE) {
+            arm_rx(vendor_interface.rhport);
+        }
     }       
 }
 
