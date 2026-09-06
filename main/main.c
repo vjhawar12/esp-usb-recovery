@@ -106,7 +106,8 @@ typedef enum mcu_interface_err_t {
     MCU_INTERFACE_ERR_ENTER_RECOVERY,
     MCU_INTERFACE_ERR_RECOVER_TARGET,
     MCU_INTERFACE_ERR_GENERATE_REPORT,
-    MCU_INTERFACE_INVALID_CMD
+    MCU_INTERFACE_INVALID_CMD,
+    MCU_INTERFACE_ERR_UNKNOWN
 } mcu_interface_err_t;
 
 typedef struct {
@@ -327,11 +328,11 @@ vendor_err_t arm_rx(uint8_t rhport) {
     for (int tries = 0; tries < BUFFER_POOL_NUM; tries++) {
         buff_count = (buff_count + 1) % BUFFER_POOL_NUM;
         if (out_buff[buff_count].state == BUFFER_FREE) {
+            TU_ASSERT(usbd_edpt_claim(vendor_interface.rhport, vendor_interface.ep_addr_out), VENDOR_RX_ENDPOINT_BUSY);
             if (!usbd_edpt_xfer(vendor_interface.rhport, vendor_interface.ep_addr_out, out_buff[buff_count].buff, vendor_interface.max_out_packet_size)) {
                 rx_state = RX_IDLE;
                 return VENDOR_RX_DCD_ERR;
             }
-            TU_ASSERT(usbd_edpt_claim(vendor_interface.rhport, vendor_interface.ep_addr_out), VENDOR_RX_ENDPOINT_BUSY);
             out_buff[buff_count].state = BUFFER_ARMED; // buffer is sending data via the queue so this buffer cannot be reused until the command parser confirms it receives data
             rx_state = RX_ARMED;
             return VENDOR_ERR_OK;
@@ -595,7 +596,7 @@ vendor_err_t vendor_write(uint8_t* buffer, uint32_t ms) {
             break;
         case VENDOR_TX_DCD_ERR:
             handle_dcd_error();
-            break;
+            return VENDOR_TX_DCD_ERR;
         case VENDOR_TX_ENDPOINT_BUSY:
             return VENDOR_TX_FULL;
         default:
@@ -627,7 +628,7 @@ int uart_read_from_mcu(uint8_t* buffer, uint8_t max_length, uint8_t max_time_ms)
 }
 
 mcu_interface_err_t handle_identify() {
-    vendor_err_t err = vendor_write((uint8_t*)"HANDLING IDENTIFY\r\n", pdMS_TO_TICKS(30)); 
+    vendor_err_t err = vendor_write((uint8_t*)"HANDLING IDENTIFY\r\n", 30); 
     switch (err) {
         case VENDOR_ERR_OK:
             return MCU_INTERFACE_ERR_OK; 
@@ -636,13 +637,13 @@ mcu_interface_err_t handle_identify() {
         case VENDOR_TX_TIMEOUT:
             break;
         default:
-            return VENDOR_ERR_UNKNOWN;
+            return MCU_INTERFACE_ERR_UNKNOWN;
     }
     return MCU_INTERFACE_ERR_IDENTIFY;
 }
 
 mcu_interface_err_t handle_get_status() {
-    vendor_err_t err = vendor_write((uint8_t*)"HANDLING GET STATUS\r\n", pdMS_TO_TICKS(30));
+    vendor_err_t err = vendor_write((uint8_t*)"HANDLING GET STATUS\r\n", 30);
     switch (err) {
         case VENDOR_ERR_OK:
             return MCU_INTERFACE_ERR_OK; 
@@ -651,13 +652,13 @@ mcu_interface_err_t handle_get_status() {
         case VENDOR_TX_TIMEOUT:
             break;
         default:
-            return VENDOR_ERR_UNKNOWN;
+            return MCU_INTERFACE_ERR_UNKNOWN;
     }
-    return MCU_INTERFACE_ERR_IDENTIFY;
+    return MCU_INTERFACE_ERR_GET_STATUS;
 }
 
 mcu_interface_err_t handle_capture_state() {
-    vendor_err_t err = vendor_write((uint8_t*)"HANDLING CAPTURE STATE\r\n", pdMS_TO_TICKS(30));
+    vendor_err_t err = vendor_write((uint8_t*)"HANDLING CAPTURE STATE\r\n", 30);
     switch (err) {
         case VENDOR_ERR_OK:
             return MCU_INTERFACE_ERR_OK; 
@@ -666,13 +667,13 @@ mcu_interface_err_t handle_capture_state() {
         case VENDOR_TX_TIMEOUT:
             break;
         default:
-            return VENDOR_ERR_UNKNOWN;
+            return MCU_INTERFACE_ERR_UNKNOWN;
     }
     return MCU_INTERFACE_ERR_CAPTURE_STATE;
 }
 
 mcu_interface_err_t handle_get_fault_context() {
-    vendor_err_t err = vendor_write((uint8_t*)"HANDLING GET FAULT CONTEXT\r\n", pdMS_TO_TICKS(30));
+    vendor_err_t err = vendor_write((uint8_t*)"HANDLING GET FAULT CONTEXT\r\n", 30);
     switch (err) {
         case VENDOR_ERR_OK:
             return MCU_INTERFACE_ERR_OK; 
@@ -681,13 +682,13 @@ mcu_interface_err_t handle_get_fault_context() {
         case VENDOR_TX_TIMEOUT:
             break;
         default:
-            return VENDOR_ERR_UNKNOWN;
+            return MCU_INTERFACE_ERR_UNKNOWN;
     }
     return MCU_INTERFACE_ERR_GET_FAULT_CONTEXT;
 }
 
 mcu_interface_err_t handle_diagnose() {
-    vendor_err_t err = vendor_write((uint8_t*)"HANDLING DIAGNOSE\r\n", pdMS_TO_TICKS(30));
+    vendor_err_t err = vendor_write((uint8_t*)"HANDLING DIAGNOSE\r\n", 30);
     switch (err) {
         case VENDOR_ERR_OK:
             return MCU_INTERFACE_ERR_OK; 
@@ -696,13 +697,13 @@ mcu_interface_err_t handle_diagnose() {
         case VENDOR_TX_TIMEOUT:
             break;
         default:
-            return VENDOR_ERR_UNKNOWN;
+            return MCU_INTERFACE_ERR_UNKNOWN;
     }
     return MCU_INTERFACE_ERR_DIAGNOSE;
 }   
 
 mcu_interface_err_t handle_verify_firmware() {
-    vendor_err_t err = vendor_write((uint8_t*)"HANDLING VERIFY FIRMWARE\r\n", pdMS_TO_TICKS(30));
+    vendor_err_t err = vendor_write((uint8_t*)"HANDLING VERIFY FIRMWARE\r\n", 30);
     switch (err) {
         case VENDOR_ERR_OK:
             return MCU_INTERFACE_ERR_OK; 
@@ -711,13 +712,13 @@ mcu_interface_err_t handle_verify_firmware() {
         case VENDOR_TX_TIMEOUT:
             break;
         default:
-            return VENDOR_ERR_UNKNOWN;
+            return MCU_INTERFACE_ERR_UNKNOWN;
     }
     return MCU_INTERFACE_ERR_VERIFY_FIRMWARE;
 }
 
 mcu_interface_err_t handle_reset_target() {
-    vendor_err_t err = vendor_write((uint8_t*)"HANDLING RESET TARGET\r\n", pdMS_TO_TICKS(30));
+    vendor_err_t err = vendor_write((uint8_t*)"HANDLING RESET TARGET\r\n", 30);
     switch (err) {
         case VENDOR_ERR_OK:
             return MCU_INTERFACE_ERR_OK; 
@@ -726,13 +727,13 @@ mcu_interface_err_t handle_reset_target() {
         case VENDOR_TX_TIMEOUT:
             break;
         default:
-            return VENDOR_ERR_UNKNOWN;
+            return MCU_INTERFACE_ERR_UNKNOWN;
     }
     return MCU_INTERFACE_ERR_RESET_TARGET;
 }
 
 mcu_interface_err_t handle_enter_recovery() {
-    vendor_err_t err = vendor_write((uint8_t*)"HANDLING ENTER RECOVERY\r\n", pdMS_TO_TICKS(30));
+    vendor_err_t err = vendor_write((uint8_t*)"HANDLING ENTER RECOVERY\r\n", 30);
     switch (err) {
         case VENDOR_ERR_OK:
             return MCU_INTERFACE_ERR_OK; 
@@ -741,13 +742,13 @@ mcu_interface_err_t handle_enter_recovery() {
         case VENDOR_TX_TIMEOUT:
             break;
         default:
-            return VENDOR_ERR_UNKNOWN;
+            return MCU_INTERFACE_ERR_UNKNOWN;
     }
     return MCU_INTERFACE_ERR_ENTER_RECOVERY;
 }
 
 mcu_interface_err_t handle_recover_target() {
-    vendor_err_t err = vendor_write((uint8_t*)"HANDLING RECOVER TARGET\r\n", pdMS_TO_TICKS(30));
+    vendor_err_t err = vendor_write((uint8_t*)"HANDLING RECOVER TARGET\r\n", 30);
     switch (err) {
         case VENDOR_ERR_OK:
             return MCU_INTERFACE_ERR_OK; 
@@ -756,13 +757,13 @@ mcu_interface_err_t handle_recover_target() {
         case VENDOR_TX_TIMEOUT:
             break;
         default:
-            return VENDOR_ERR_UNKNOWN;
+            return MCU_INTERFACE_ERR_UNKNOWN;
     }
     return MCU_INTERFACE_ERR_RECOVER_TARGET;
 }
 
 mcu_interface_err_t handle_generate_report() {
-    vendor_err_t err = vendor_write((uint8_t*)"HANDLING GENERATE REPORT\r\n", pdMS_TO_TICKS(30));
+    vendor_err_t err = vendor_write((uint8_t*)"HANDLING GENERATE REPORT\r\n", 30);
     switch (err) {
         case VENDOR_ERR_OK:
             return MCU_INTERFACE_ERR_OK; 
@@ -771,7 +772,7 @@ mcu_interface_err_t handle_generate_report() {
         case VENDOR_TX_TIMEOUT:
             break;
         default:
-            return VENDOR_ERR_UNKNOWN;
+            return MCU_INTERFACE_ERR_UNKNOWN;
     }
     return MCU_INTERFACE_ERR_GENERATE_REPORT;
 }
