@@ -8,6 +8,7 @@
 #include "driver/uart.h"
 #include "device/usbd_pvt.h"
 #include "device/dcd.h"  
+#include "tinyusb_default_config.h"
 
 #define TAG "Diagnostic ESP32-S3"
 #define LOG(msg) ESP_LOGW(TAG, msg)
@@ -26,6 +27,8 @@
 #define CDC_NOTIFICATION_IN 0x81
 #define CDC_DATA_OUT 0x02
 #define CDC_DATA_IN 0x82
+
+#define CONFIG_TINYUSB_TASK_STACK_SIZE 4096
 
 // vendor interface with 2 endpoints, EP3 Bulk Out and EP3 Bulk In
 #define TUD_VENDOR_DESCRIPTOR_CUSTOM(_itfnum,_stridx,_epin,_epout,_epsize) \
@@ -52,9 +55,9 @@
 
 #define BUFFER_POOL_NUM 5
 
-void recovery_vendor_init(void);
-bool recovery_vendor_deinit(void);
-void recovery_vendor_reset(uint8_t rhport);
+static void recovery_vendor_init(void);
+static bool recovery_vendor_deinit(void);
+static void recovery_vendor_reset(uint8_t rhport);
 uint16_t recovery_vendor_open(uint8_t rhport, const tusb_desc_interface_t *desc_itf, uint16_t max_len);
 bool recovery_vendor_control_completed_cb(uint8_t rhport, uint8_t stage, tusb_control_request_t const* request);
 bool recovery_vendor_data_completed_cb(uint8_t rhport, uint8_t ep_addr, xfer_result_t result, uint32_t xferred_bytes);
@@ -274,7 +277,7 @@ TaskHandle_t my_task_handle;
    └─ IN  Lane (0x82) : Bulk EP2 IN Hardware FIFO  (Device -> Host TX Data)
 
  ------------------------------------------------------------------------------
- [EP3] - Vendor Custom Class InteDIAGNOSTIC ESP32-S3]rface
+ [EP3] - Vendor Custom Class Interface
    ├─ OUT Lane (0x03) : Bulk EP3 OUT Hardware FIFO (Host -> Device RX Stream)
    └─ IN  Lane (0x83) : Bulk EP3 IN Hardware FIFO  (Device -> Host TX Stream)
 
@@ -292,7 +295,7 @@ const tinyusb_desc_config_t descriptor = {
     .string = string_desc,
     .qualifier = NULL, // ESP32 S3 only runs at full speed, not high speed so qualifier is omitted
     .full_speed_config = full_speed_config,
-    .high_speed_config = NULL
+    .high_speed_config = NULL,
 };
 
 // using internal PHY on ESP32-S3
@@ -519,8 +522,9 @@ static void usb_init() {
         .descriptor = descriptor,
         .port = TINYUSB_PORT_FULL_SPEED_0,
         .phy = phy,
+        .task = TINYUSB_TASK_DEFAULT(),
         .event_cb = NULL,
-        .event_arg = NULL
+        .event_arg = NULL,
     };
     //  initialize the entire USB subsystem on the chip.
     ESP_ERROR_CHECK(tinyusb_driver_install(&config)); 
@@ -801,7 +805,7 @@ static void parse_vendor_commands(void *pvParams) {
         xQueueReceive(vendor_queue, &payload, portMAX_DELAY);
         payload->state = BUFFERED_PROCESSING;
         if (!strcmp((const char*)payload->buff, "PING\r\n")) {
-            cdc_write_string(TAG "PONG\r\n");
+            vendor_write((uint8_t*)TAG "PONG\r\n", 30);
         } else if (!strcmp((const char*)payload->buff, "IDENTIFY\r\n")) {
             err = handle_identify();
         } else if (!strcmp((const char*)payload->buff, "GET STATUS\r\n"))  {
@@ -848,6 +852,7 @@ void app_main(void) {
     uart_init();
     xTaskCreate(parse_vendor_commands, "Parse Vendor Commands Task", 512, NULL, 5, &my_task_handle);
     while (1) {
-        vTaskDelay(pdMS_TO_TICKS(100));
+        vTaskDelay(pdMS_TO_TICKS(500));
+        ESP_LOGW(TAG, "HEARTBEAT"); 
     }
 }
