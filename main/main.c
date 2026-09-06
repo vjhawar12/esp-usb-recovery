@@ -51,7 +51,6 @@
 #define VENDOR_INTERFACE_PROTOCOL 0
 
 #define BUFFER_POOL_NUM 5
-#define MAX_RETRIES 100
 
 void recovery_vendor_init(void);
 bool recovery_vendor_deinit(void);
@@ -103,7 +102,8 @@ typedef enum mcu_interface_err_t {
     RESET_TARGET,
     ENTER_RECOVERY,
     RECOVER_TARGET,
-    GENERATE_REPORT
+    GENERATE_REPORT,
+    MCU_INTERFACE_INVALID_CMD
 } mcu_interface_err_t;
 
 typedef struct {
@@ -145,7 +145,7 @@ typedef enum buffer_state_t {
     BUFFER_FREE,
     BUFFER_ARMED,
     BUFFER_QUEUED,
-    BUFFER_PROCESSED,
+    BUFFERED_PROCESSING,
 } buffer_state_t;
 
 typedef enum rx_state_t {
@@ -324,11 +324,16 @@ vendor_err_t arm_rx(uint8_t rhport) {
     for (int tries = 0; tries < BUFFER_POOL_NUM; tries++) {
         buff_count = (buff_count + 1) % BUFFER_POOL_NUM;
         if (out_buff[buff_count].state == BUFFER_FREE) {
-            TU_ASSERT(usbd_edpt_xfer(rhport, vendor_interface.ep_addr_out, out_buff[buff_count].buff, vendor_interface.max_out_packet_size), VENDOR_RX_DCD_ERR);
+            if (!usbd_edpt_xfer(rhport, vendor_interface.ep_addr_out, out_buff[buff_count].buff, vendor_interface.max_out_packet_size)) {
+                rx_state = RX_IDLE;
+                return VENDOR_RX_DCD_ERR;
+            }
             out_buff[buff_count].state = BUFFER_ARMED; // buffer is sending data via the queue so this buffer cannot be reused until the command parser confirms it receives data
+            rx_state = RX_ARMED;
             return VENDOR_ERR_OK;
         }
     }
+    rx_state = RX_NO_BUFFER_FREE;
     return VENDOR_NO_BUFFER_FREE; 
 }
 
@@ -358,7 +363,6 @@ Arm the OUT endpoint
 Return how many descriptor bytes were consumed
 */
 uint16_t recovery_vendor_open(uint8_t rhport, const tusb_desc_interface_t *desc_itf, uint16_t max_len) {
-    static int retries = 0;
     // validate interface class, subclass, protocol
     TU_ASSERT(desc_itf->bInterfaceClass == VENDOR_INTERFACE_CLASS, VENDOR_ERR_USB_DESC); 
     TU_ASSERT(desc_itf->bInterfaceSubClass == VENDOR_INTERFACE_SUBCLASS, VENDOR_ERR_USB_DESC); 
@@ -413,18 +417,14 @@ uint16_t recovery_vendor_open(uint8_t rhport, const tusb_desc_interface_t *desc_
     vendor_err_t armed = arm_rx(rhport);
     switch (armed) {
         case VENDOR_ERR_OK:
-            retries = 0;
             break;
         case VENDOR_NO_BUFFER_FREE:
-            retries++;
+            break;
         case VENDOR_RX_DCD_ERR:
-            retries++;
             handle_dcd_error();
+            break;
         default:
             break;
-    }
-    if (retries > MAX_RETRIES) {
-        handle_max_retries_exceeded();
     }
     return (uint16_t)((uintptr_t)p_desc - (uintptr_t)desc_itf);
 }
@@ -436,7 +436,6 @@ bool recovery_vendor_control_completed_cb(uint8_t rhport, uint8_t stage, tusb_co
 
 // runs when data (interrupt/bulk) transfer finishes on an endpoint. This could be OUT/RX or IN/TX.  
 bool recovery_vendor_data_completed_cb(uint8_t rhport, uint8_t ep_addr, xfer_result_t result, uint32_t xferred_bytes) {
-    static int retries = 0;
     if (result != XFER_RESULT_SUCCESS) {
         return false;
     }
@@ -462,18 +461,14 @@ bool recovery_vendor_data_completed_cb(uint8_t rhport, uint8_t ep_addr, xfer_res
         vendor_err_t armed = arm_rx(rhport);
         switch (armed) {
             case VENDOR_ERR_OK:
-                retries = 0;
                 break;
             case VENDOR_NO_BUFFER_FREE:
-                retries++;
+                break;
             case VENDOR_RX_DCD_ERR:
-                retries++;
                 handle_dcd_error();
+                break;
             default:
                 break;
-        }
-        if (retries > MAX_RETRIES) {
-            handle_max_retries_exceeded();
         }
     }
     return true;
@@ -588,9 +583,15 @@ vendor_err_t vendor_write(uint8_t* buffer, uint32_t ms) {
     memcpy(in_buff, buffer, size);
     // arming hardware
     vendor_err_t armed = arm_tx(0, size);
-    if (armed != VENDOR_ERR_OK) {
-        handle_failed_to_arm(0);
-    } 
+    switch (armed) {
+        case VENDOR_ERR_OK:
+            break;
+        case VENDOR_TX_DCD_ERR:
+            handle_dcd_error();
+            break;
+        default:
+            break;
+    }
     // waiting for tx_done to be set
     ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(ms)); 
     // logging via CDC
@@ -676,8 +677,7 @@ static void parse_vendor_commands(void *pvParams) {
     mcu_interface_err_t err;
     while (1) {
         xQueueReceive(vendor_queue, &payload, portMAX_DELAY);
-        payload->state = BUFFER_PROCESSED;
-        rx_state = RX_IDLE;
+        payload->state = BUFFERED_PROCESSING;
         if (!strcmp((const char*)payload->buff, "PING\r\n")) {
             cdc_write_string(TAG "PONG\r\n");
         } else if (!strcmp((const char*)payload->buff, "IDENTIFY\r\n")) {
@@ -701,7 +701,7 @@ static void parse_vendor_commands(void *pvParams) {
         } else if (!strcmp((const char*)payload->buff, "GENERATE REPORT\r\n")) { 
             err = handle_generate_report();
         } else {
-            
+            err = MCU_INTERFACE_INVALID_CMD;
         }
         if (err != MCU_INTERFACE_ERR_OK) {
 
