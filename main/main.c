@@ -104,7 +104,7 @@ typedef struct {
   uint16_t max_in_packet_size, max_out_packet_size; // max packet sizes for each out/in packet
   uint8_t rhport; // root hub usb controller port (should be 0 for single usb controller chips)
   bool tx_done; // set when a single low-level USB transaction (device -> host) is completed 
-  bool rx_done; // set when a signle low-level USB transaction (host -> device) is completed
+  bool rx_done; // set when a single low-level USB transaction (host -> device) is completed
 } recovery_vendor_interface_t; 
 
 CFG_TUSB_MEM_ALIGN
@@ -116,6 +116,26 @@ typedef struct vendor_payload_t { // buffer + metadata like occupied and length
     uint8_t buff[VENDOR_MAX_BUFFER_SIZE];
 } vendor_payload_t;
 
+/* 
+Buffers are static so pointers to them persist even once the callback returns, this lets us queue a 4 byte pointer rather than
+a potentially very large struct object. 
+
+A buffer pool is used to keep track of which buffer tinyUSB is using so that I don't modify the buffer while TinyUSB is, as that would 
+corrupt the USB data.
+
+A buffer is marked occupied when handed to TinyUSB and remains occupied while its pointer is queued/processed by the command task.
+ 
+Ownership:
+FREE -> USB RX -> vendor_queue -> command parser -> FREE
+
+Rx (defined as host -> device) needs a buffer pool because we're processing messages from the host in this code and handing the message off
+to another task, and a potential issue could be one buffer is being filled up with data while another message arrived from the host and the same buffer
+is being reused, hence the buffer pool so a buffer that is free could be used for the incoming data
+
+The TX side is simpler because we're just sending a message to the host and processing it host-side. We only send the next transmission once the current
+has finished so we have control over the overlap, unlike RX where we don't know when the host will send and thus need the buffer pool.
+*/
+
 static vendor_payload_t out_buff[BUFFER_POOL_NUM] = {0};  // buffer pool, each buffer points to the physical usb packet from host -> device
 static recovery_vendor_interface_t vendor_interface; // metadata + done flags for vendor interface 
 
@@ -126,24 +146,45 @@ typedef struct cdc_payload_t {
 } cdc_payload_t;
 
 /* 
-RX Path: 
+USB RX Path
 
-open()
- ↓
-arm out_buff
- ↓
-[Linux sends]
- ↓
-hardware fills out_buff
- ↓
-xfer_cb()
- ↓
-copy/enqueue out_buff
- ↓
-re-arm out_buff
- ↓
-[wait for next Linux packet]
+arm free pool buffer
+        ↓
+Linux sends OUT transfer
+        ↓
+USB hardware fills buffer
+        ↓
+xfer callback
+        ↓
+queue pointer to completed buffer
+        ↓
+arm another free buffer
+        ↓
+command task receives pointer
+        ↓
+process command
+        ↓
+release buffer (occupied = false)
+
+the below enums track state of inidividual buffers (buffer_state_t) and the rx engine (rx_state_t)
+based on that we can compare expected vs actual state at different points and trigger error handlers 
 */
+
+typedef enum buffer_state_t {
+    BUFFER_FREE,
+    BUFFER_ARMED,
+    BUFFER_QUEUED,
+    BUFFER_PROCESSED,
+} buffer_state_t;
+
+typedef enum rx_state_t {
+    RX_IDLE,
+    RX_ARMED,
+    RX_NO_BUFFER_FREE
+} rx_state_t; 
+
+buffer_state_t buffer_state = BUFFER_FREE;
+rx_state_t rx_state = RX_IDLE;
 
 // defines the callbacks on init, open, reset, etc
 static usbd_class_driver_t const recovery_vendor_driver = {
@@ -249,17 +290,17 @@ const tinyusb_phy_config_t phy = {
 
 static int buff_count = 0;
 
-void recovery_vendor_init(void) {
+static void recovery_vendor_init(void) {
     memset((&vendor_interface), 0, (sizeof(vendor_interface)));
 }
 
-bool recovery_vendor_deinit(void) {
+static bool recovery_vendor_deinit(void) {
     memset(in_buff, 0, sizeof(in_buff));
     memset(out_buff, 0, sizeof(out_buff)); 
     return true;
 }
 
-void recovery_vendor_reset(uint8_t rhport) {
+static void recovery_vendor_reset(uint8_t rhport) {
     (void) rhport;
     memset((&vendor_interface), 0, (sizeof(vendor_interface)));
     memset(in_buff, 0, sizeof(in_buff));
@@ -267,14 +308,16 @@ void recovery_vendor_reset(uint8_t rhport) {
 }
 
 // prepares the USB host to receive #vendor_interface.max_out_packet_size of data from device (rx transaction) 
+// Find an unowned RX buffer before arming the OUT endpoint.
+// Never reuse an occupied buffer because the command task may still be
+// reading it through a queued pointer.
 bool arm_rx(uint8_t rhport) {
-    TickType_t start_ticks = xTaskGetTickCount();
-    int tries = 0;
-    for (tries = 0; tries < BUFFER_POOL_NUM; tries++) {
+    for (int tries = 0; tries < BUFFER_POOL_NUM; tries++) {
         buff_count = (buff_count + 1) % BUFFER_POOL_NUM;
         if (!out_buff[buff_count].occupied) {
             TU_VERIFY(usbd_edpt_xfer(rhport, vendor_interface.ep_addr_out, out_buff[buff_count].buff, vendor_interface.max_out_packet_size));
-            out_buff[buff_count].occupied = true;
+            out_buff[buff_count].occupied = true; // buffer is sending data via the queue so this buffer cannot be reused until the command parser confirms it receives data
+            buffer_state = BUFFER_ARMED;
             return true;
         }
     }
@@ -296,7 +339,7 @@ Validate the endpoint topology
 Open the endpoints in TinyUSB
 Save the live interface state
 Arm the OUT endpoint
- Return how many descriptor bytes were consumed
+Return how many descriptor bytes were consumed
 */
 uint16_t recovery_vendor_open(uint8_t rhport, const tusb_desc_interface_t *desc_itf, uint16_t max_len) {
     // validate interface class, subclass, protocol
@@ -350,7 +393,8 @@ uint16_t recovery_vendor_open(uint8_t rhport, const tusb_desc_interface_t *desc_
     TU_VERIFY(usbd_edpt_open(rhport, desc_in_ep), 0);
     TU_VERIFY(usbd_edpt_open(rhport, desc_out_ep), 0);
     // arming the USB peripheral so it can accept incoming packets
-    arm_rx(rhport); 
+    bool armed = arm_rx(rhport);
+    rx_state = armed? RX_ARMED :  RX_NO_BUFFER_FREE;
     return (uint16_t)((uintptr_t)p_desc - (uintptr_t)desc_itf);
 }
 
@@ -377,9 +421,14 @@ bool recovery_vendor_data_completed_cb(uint8_t rhport, uint8_t ep_addr, xfer_res
         vendor_payload_t *payload = &out_buff[buff_count]; // passing in address of the thing we want to send
         payload->length = xferred_bytes;
         payload->buff[xferred_bytes] = 0;
+        // Queue only the pointer value, not the 2 KB vendor_payload_t.
+        // out_buff[] is static, so the pointed-to object remains valid after this
+        // callback returns. The parser releases the buffer by clearing occupied.
         TU_VERIFY(xQueueSend(vendor_queue, &payload, 0) == pdTRUE);
+        buffer_state = BUFFER_QUEUED;
         // rearming the USB peripheral so it can accept the next packet
-        arm_rx(rhport);
+        bool armed = arm_rx(rhport);
+        rx_state = armed? RX_ARMED :  RX_NO_BUFFER_FREE;
     }
     return true;
 }
@@ -413,7 +462,7 @@ void custom_tud_mount_cb() {
     conn_status = ENUMERATED;
 }
 
-void usb_init() {
+static void usb_init() {
     const tinyusb_config_t config = {
         .descriptor = descriptor,
         .port = TINYUSB_PORT_FULL_SPEED_0,
@@ -434,7 +483,7 @@ void usb_init() {
     ESP_ERROR_CHECK(tinyusb_cdcacm_init(&acm_cfg));
 }
 
-void uart_init() {
+static void uart_init() {
     const int uart_buffer_size = (1024 * 2);
     // Install UART driver using an event queue here
     ESP_ERROR_CHECK(uart_driver_install(UART_NUM, uart_buffer_size, uart_buffer_size, 10, &uart_queue, 0));
@@ -573,11 +622,13 @@ mcu_interface_err_t handle_generate_report() {
 | GENERATE_REPORT    | “Explain what happened and what was done.”                        | None                               |
 +--------------------+-------------------------------------------------------------------+------------------------------------+
 */
-void parse_vendor_commands(void *pvParams) {
+static void parse_vendor_commands(void *pvParams) {
     vendor_payload_t *payload;
     mcu_interface_err_t err;
     while (1) {
         xQueueReceive(vendor_queue, &payload, portMAX_DELAY);
+        buffer_state = BUFFER_PROCESSED;
+        rx_state = RX_IDLE;
         if (!strcmp((const char*)payload->buff, "PING\r\n")) {
             cdc_write_string(TAG "PONG\r\n");
         } else if (!strcmp((const char*)payload->buff, "IDENTIFY\r\n")) {
@@ -606,12 +657,15 @@ void parse_vendor_commands(void *pvParams) {
         if (err != MCU_INTERFACE_ERR_OK) {
 
         }
+        // Command processing is complete; USB may now reuse this pool buffer.
 	    payload->occupied = false;
+        buffer_state = BUFFER_FREE;
     }       
 }
 
-void freertos_init() {
+static void freertos_init() {
     cdc_queue = xQueueCreate(5, sizeof(cdc_payload_t)); 
+    // Queue stores vendor_payload_t pointers only; payload bytes remain in out_buff[].
     vendor_queue = xQueueCreate(5, sizeof(vendor_payload_t*)); // number of bytes to send: sizeof(vendor_payload_t*) bytes
 }
 
