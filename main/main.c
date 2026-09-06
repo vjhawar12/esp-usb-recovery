@@ -75,7 +75,13 @@ typedef enum payload_type_t {
 
 typedef enum vendor_err_t {
     VENDOR_ERR_OK,
+    VENDOR_ERR_USB_DESC,
+    VENDOR_ERR_PACKET_SIZE_EXCEEDED,
     VENDOR_TX_FULL,
+    VENDOR_TX_DCD_ERR,
+    VENDOR_RX_DCD_ERR,
+    VENDOR_INVALID_CMD,
+    VENDOR_NO_BUFFER_FREE,
 } vendor_err_t;
 
 typedef enum cdc_err_t {
@@ -312,22 +318,27 @@ static void recovery_vendor_reset(uint8_t rhport) {
 // Find an unowned RX buffer before arming the OUT endpoint.
 // Never reuse an occupied buffer because the command task may still be
 // reading it through a queued pointer.
-bool arm_rx(uint8_t rhport) {
+vendor_err_t arm_rx(uint8_t rhport) {
     for (int tries = 0; tries < BUFFER_POOL_NUM; tries++) {
         buff_count = (buff_count + 1) % BUFFER_POOL_NUM;
         if (out_buff[buff_count].state == BUFFER_FREE) {
-            TU_VERIFY(usbd_edpt_xfer(rhport, vendor_interface.ep_addr_out, out_buff[buff_count].buff, vendor_interface.max_out_packet_size));
+            TU_ASSERT(usbd_edpt_xfer(rhport, vendor_interface.ep_addr_out, out_buff[buff_count].buff, vendor_interface.max_out_packet_size), VENDOR_RX_DCD_ERR);
             out_buff[buff_count].state = BUFFER_ARMED; // buffer is sending data via the queue so this buffer cannot be reused until the command parser confirms it receives data
-            return true;
+            return VENDOR_ERR_OK;
         }
     }
-    return false; 
+    return VENDOR_NO_BUFFER_FREE; 
 }
 
 // prepares the USB host to send #total_bytes bytes of data to device (tx transaction)
-bool arm_tx(uint8_t rhport, uint16_t total_bytes) {
-    TU_VERIFY(usbd_edpt_xfer(rhport, vendor_interface.ep_addr_in, in_buff, total_bytes));
-    return true;
+vendor_err_t arm_tx(uint8_t rhport, uint16_t total_bytes) {
+    TU_ASSERT(usbd_edpt_xfer(rhport, vendor_interface.ep_addr_in, in_buff, total_bytes), VENDOR_TX_DCD_ERR);
+    return VENDOR_ERR_OK;
+}
+
+// rx = 1 => rx; rx = 0 => tx
+void handle_failed_to_arm(int rx) {
+
 }
 
 /* 
@@ -343,12 +354,12 @@ Return how many descriptor bytes were consumed
 */
 uint16_t recovery_vendor_open(uint8_t rhport, const tusb_desc_interface_t *desc_itf, uint16_t max_len) {
     // validate interface class, subclass, protocol
-    TU_VERIFY(desc_itf->bInterfaceClass == VENDOR_INTERFACE_CLASS, 0); 
-    TU_VERIFY(desc_itf->bInterfaceSubClass == VENDOR_INTERFACE_SUBCLASS, 0); 
-    TU_VERIFY(desc_itf->bInterfaceProtocol == VENDOR_INTERFACE_PROTOCOL, 0);
+    TU_ASSERT(desc_itf->bInterfaceClass == VENDOR_INTERFACE_CLASS, VENDOR_ERR_USB_DESC); 
+    TU_ASSERT(desc_itf->bInterfaceSubClass == VENDOR_INTERFACE_SUBCLASS, VENDOR_ERR_USB_DESC); 
+    TU_ASSERT(desc_itf->bInterfaceProtocol == VENDOR_INTERFACE_PROTOCOL, VENDOR_ERR_USB_DESC);
     // validate interface topology: 1 interface with 1 bulk in, 1 bulk out, no alternate settings
-    TU_VERIFY(desc_itf->bNumEndpoints == 2, 0); 
-    TU_VERIFY(desc_itf->bAlternateSetting == 0, 0); 
+    TU_ASSERT(desc_itf->bNumEndpoints == 2, VENDOR_ERR_USB_DESC); 
+    TU_ASSERT(desc_itf->bAlternateSetting == 0, VENDOR_ERR_USB_DESC); 
     const uint8_t* desc_end = (const uint8_t*)desc_itf + max_len; // end of descriptor region available to this open() call
     const uint8_t* p_desc = tu_desc_next(desc_itf); // point to endpoint descriptor
     int bulk_endpoint_in_count = 0;
@@ -366,35 +377,37 @@ uint16_t recovery_vendor_open(uint8_t rhport, const tusb_desc_interface_t *desc_
         } else if (desc_type == TUSB_DESC_ENDPOINT) {
             if (tu_edpt_dir(desc_ep->bEndpointAddress) == TUSB_DIR_IN) {
                 bulk_endpoint_in_count++;
-                TU_VERIFY(bulk_endpoint_in_count == 1, 0);
+                TU_ASSERT(bulk_endpoint_in_count == 1, VENDOR_ERR_USB_DESC);
                 desc_in_ep = desc_ep; 
-                TU_VERIFY(desc_in_ep->bmAttributes.xfer == TUSB_XFER_BULK, 0);
+                TU_ASSERT(desc_in_ep->bmAttributes.xfer == TUSB_XFER_BULK, VENDOR_ERR_USB_DESC);
                 in_size = tu_edpt_packet_size(desc_in_ep);
-                TU_VERIFY(in_size <= MAX_IN_PACKET_SIZE, 0);
+                TU_ASSERT(in_size <= MAX_IN_PACKET_SIZE, VENDOR_ERR_PACKET_SIZE_EXCEEDED);
             } else {
                 bulk_endpoint_out_count++;
-                TU_VERIFY(bulk_endpoint_out_count == 1, 0);
+                TU_ASSERT(bulk_endpoint_out_count == 1, VENDOR_ERR_USB_DESC);
                 desc_out_ep = desc_ep;
-                TU_VERIFY(desc_out_ep->bmAttributes.xfer == TUSB_XFER_BULK, 0);
+                TU_ASSERT(desc_out_ep->bmAttributes.xfer == TUSB_XFER_BULK, VENDOR_ERR_USB_DESC);
                 out_size = tu_edpt_packet_size(desc_out_ep);
-                TU_VERIFY(out_size <= MAX_OUT_PACKET_SIZE, 0);
+                TU_ASSERT(out_size <= MAX_OUT_PACKET_SIZE, VENDOR_ERR_PACKET_SIZE_EXCEEDED);
             }
         }
         p_desc = tu_desc_next(p_desc);
     }
-    TU_VERIFY(bulk_endpoint_in_count == 1);
-    TU_VERIFY(bulk_endpoint_out_count == 1);
+    TU_ASSERT(bulk_endpoint_in_count == 1, VENDOR_ERR_USB_DESC);
+    TU_ASSERT(bulk_endpoint_out_count == 1, VENDOR_ERR_USB_DESC);
     vendor_interface.itf_num = desc_itf->bInterfaceNumber;
     vendor_interface.rhport = rhport;
     vendor_interface.ep_addr_in  = desc_in_ep->bEndpointAddress;
     vendor_interface.max_in_packet_size = in_size;
     vendor_interface.ep_addr_out = desc_out_ep->bEndpointAddress;
     vendor_interface.max_out_packet_size = out_size;
-    TU_VERIFY(usbd_edpt_open(rhport, desc_in_ep), 0);
-    TU_VERIFY(usbd_edpt_open(rhport, desc_out_ep), 0);
+    TU_ASSERT(usbd_edpt_open(rhport, desc_in_ep), VENDOR_ERR_USB_DESC);
+    TU_ASSERT(usbd_edpt_open(rhport, desc_out_ep), VENDOR_ERR_USB_DESC);
     // arming the USB peripheral so it can accept incoming packets
-    bool armed = arm_rx(rhport);
-    rx_state = armed? RX_ARMED :  RX_NO_BUFFER_FREE;
+    vendor_err_t armed = arm_rx(rhport);
+    if (armed != VENDOR_ERR_OK) {
+        handle_failed_to_arm(1);
+    }
     return (uint16_t)((uintptr_t)p_desc - (uintptr_t)desc_itf);
 }
 
@@ -541,7 +554,10 @@ vendor_err_t vendor_write(uint8_t* buffer, uint32_t ms) {
     size_t size = sizeof(buffer);
     memcpy(in_buff, buffer, size);
     // arming hardware
-    arm_tx(0, size); 
+    vendor_err_t armed = arm_tx(0, size);
+    if (armed != VENDOR_ERR_OK) {
+        handle_failed_to_arm(0);
+    } 
     // waiting for tx_done to be set
     ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(ms)); 
     // logging via CDC
