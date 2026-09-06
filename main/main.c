@@ -75,6 +75,7 @@ typedef enum payload_type_t {
 
 typedef enum vendor_err_t {
     VENDOR_ERR_OK,
+    VENDOR_TX_TIMEOUT,
     VENDOR_ERR_USB_DESC,
     VENDOR_ERR_PACKET_SIZE_EXCEEDED,
     VENDOR_TX_FULL,
@@ -84,6 +85,7 @@ typedef enum vendor_err_t {
     VENDOR_RX_DCD_ERR,
     VENDOR_INVALID_CMD,
     VENDOR_NO_BUFFER_FREE,
+    VENDOR_ERR_UNKNOWN
 } vendor_err_t;
 
 typedef enum cdc_err_t {
@@ -94,16 +96,16 @@ typedef enum cdc_err_t {
 
 typedef enum mcu_interface_err_t {
     MCU_INTERFACE_ERR_OK,
-    IDENTIFY,
-    GET_STATUS,
-    CAPTURE_STATE,
-    GET_FAULT_CONTEXT,
-    DIAGNOSE,
-    VERIFY_FIRMWARE,
-    RESET_TARGET,
-    ENTER_RECOVERY,
-    RECOVER_TARGET,
-    GENERATE_REPORT,
+    MCU_INTERFACE_ERR_IDENTIFY,
+    MCU_INTERFACE_ERR_GET_STATUS,
+    MCU_INTERFACE_ERR_CAPTURE_STATE,
+    MCU_INTERFACE_ERR_GET_FAULT_CONTEXT,
+    MCU_INTERFACE_ERR_DIAGNOSE,
+    MCU_INTERFACE_ERR_VERIFY_FIRMWARE,
+    MCU_INTERFACE_ERR_RESET_TARGET,
+    MCU_INTERFACE_ERR_ENTER_RECOVERY,
+    MCU_INTERFACE_ERR_RECOVER_TARGET,
+    MCU_INTERFACE_ERR_GENERATE_REPORT,
     MCU_INTERFACE_INVALID_CMD
 } mcu_interface_err_t;
 
@@ -322,7 +324,6 @@ static void recovery_vendor_reset(uint8_t rhport) {
 // Never reuse an occupied buffer because the command task may still be
 // reading it through a queued pointer.
 vendor_err_t arm_rx(uint8_t rhport) {
-    TU_ASSERT(usbd_edpt_claim(vendor_interface.rhport, vendor_interface.ep_addr_in), VENDOR_RX_ENDPOINT_BUSY);
     for (int tries = 0; tries < BUFFER_POOL_NUM; tries++) {
         buff_count = (buff_count + 1) % BUFFER_POOL_NUM;
         if (out_buff[buff_count].state == BUFFER_FREE) {
@@ -330,6 +331,7 @@ vendor_err_t arm_rx(uint8_t rhport) {
                 rx_state = RX_IDLE;
                 return VENDOR_RX_DCD_ERR;
             }
+            TU_ASSERT(usbd_edpt_claim(vendor_interface.rhport, vendor_interface.ep_addr_out), VENDOR_RX_ENDPOINT_BUSY);
             out_buff[buff_count].state = BUFFER_ARMED; // buffer is sending data via the queue so this buffer cannot be reused until the command parser confirms it receives data
             rx_state = RX_ARMED;
             return VENDOR_ERR_OK;
@@ -347,10 +349,6 @@ vendor_err_t arm_tx(uint8_t rhport, uint16_t total_bytes) {
 }
 
 void handle_dcd_error() {
-
-}
-
-void handle_max_retries_exceeded() {
 
 }
 
@@ -584,16 +582,13 @@ cdc_err_t cdc_write_bytes(uint8_t* buffer, size_t size) {
 // clear tx_done flag, fill buffer, arm hardware, wait for tx_done flag to be set by callback
 // to write a string a cast can be used
 vendor_err_t vendor_write(uint8_t* buffer, uint32_t ms) {
-     // claim endpoint before submiting transfer
-    if (!usbd_edpt_claim(0, VENDOR_BULK_IN)) {
-        return VENDOR_TX_FULL;
-    }
     // clearing tx_done flag
     vendor_interface.tx_done = false;
     // filling buffer
-    size_t size = sizeof(buffer);
+    size_t size = strnlen((const char*)buffer, VENDOR_MAX_BUFFER_SIZE);
     memcpy(in_buff, buffer, size);
     // arming hardware
+    // arm_tx claims endpoint before submiting transfer
     vendor_err_t armed = arm_tx(0, size);
     switch (armed) {
         case VENDOR_ERR_OK:
@@ -601,11 +596,15 @@ vendor_err_t vendor_write(uint8_t* buffer, uint32_t ms) {
         case VENDOR_TX_DCD_ERR:
             handle_dcd_error();
             break;
+        case VENDOR_TX_ENDPOINT_BUSY:
+            return VENDOR_TX_FULL;
         default:
             break;
     }
     // waiting for tx_done to be set
-    ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(ms)); 
+    if (ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(ms)) == 0) {
+        return VENDOR_TX_TIMEOUT;
+    }
     // logging via CDC
     char in_buffer[64];
     snprintf(in_buffer, sizeof(in_buffer), "[DATA_SENT] %u Bytes sent\r\n", size);
@@ -628,43 +627,153 @@ int uart_read_from_mcu(uint8_t* buffer, uint8_t max_length, uint8_t max_time_ms)
 }
 
 mcu_interface_err_t handle_identify() {
-    return vendor_write((uint8_t*)"HANDLE IDENTIFY PLACEHOLDER\r\n", pdMS_TO_TICKS(30)) != VENDOR_ERR_OK? IDENTIFY : MCU_INTERFACE_ERR_OK;
+    vendor_err_t err = vendor_write((uint8_t*)"HANDLING IDENTIFY\r\n", pdMS_TO_TICKS(30)); 
+    switch (err) {
+        case VENDOR_ERR_OK:
+            return MCU_INTERFACE_ERR_OK; 
+        case VENDOR_TX_FULL:
+            break;
+        case VENDOR_TX_TIMEOUT:
+            break;
+        default:
+            return VENDOR_ERR_UNKNOWN;
+    }
+    return MCU_INTERFACE_ERR_IDENTIFY;
 }
 
 mcu_interface_err_t handle_get_status() {
-    return vendor_write((uint8_t*)"HANDLE GET STATUS PLACEHOLDER\r\n", pdMS_TO_TICKS(30)) != VENDOR_ERR_OK? GET_STATUS : MCU_INTERFACE_ERR_OK;
+    vendor_err_t err = vendor_write((uint8_t*)"HANDLING GET STATUS\r\n", pdMS_TO_TICKS(30));
+    switch (err) {
+        case VENDOR_ERR_OK:
+            return MCU_INTERFACE_ERR_OK; 
+        case VENDOR_TX_FULL:
+            break;
+        case VENDOR_TX_TIMEOUT:
+            break;
+        default:
+            return VENDOR_ERR_UNKNOWN;
+    }
+    return MCU_INTERFACE_ERR_IDENTIFY;
 }
 
 mcu_interface_err_t handle_capture_state() {
-    return vendor_write((uint8_t*)"HANDLE CAPTURE STATE PLACEHOLDER\r\n", pdMS_TO_TICKS(30)) != VENDOR_ERR_OK? CAPTURE_STATE : MCU_INTERFACE_ERR_OK;
+    vendor_err_t err = vendor_write((uint8_t*)"HANDLING CAPTURE STATE\r\n", pdMS_TO_TICKS(30));
+    switch (err) {
+        case VENDOR_ERR_OK:
+            return MCU_INTERFACE_ERR_OK; 
+        case VENDOR_TX_FULL:
+            break;
+        case VENDOR_TX_TIMEOUT:
+            break;
+        default:
+            return VENDOR_ERR_UNKNOWN;
+    }
+    return MCU_INTERFACE_ERR_CAPTURE_STATE;
 }
 
 mcu_interface_err_t handle_get_fault_context() {
-    return vendor_write((uint8_t*)"HANDLE GET FAULT CONTEXT\r\n", pdMS_TO_TICKS(30)) != VENDOR_ERR_OK? GET_FAULT_CONTEXT : MCU_INTERFACE_ERR_OK;
+    vendor_err_t err = vendor_write((uint8_t*)"HANDLING GET FAULT CONTEXT\r\n", pdMS_TO_TICKS(30));
+    switch (err) {
+        case VENDOR_ERR_OK:
+            return MCU_INTERFACE_ERR_OK; 
+        case VENDOR_TX_FULL:
+            break;
+        case VENDOR_TX_TIMEOUT:
+            break;
+        default:
+            return VENDOR_ERR_UNKNOWN;
+    }
+    return MCU_INTERFACE_ERR_GET_FAULT_CONTEXT;
 }
 
 mcu_interface_err_t handle_diagnose() {
-    return vendor_write((uint8_t*)"HANDLE DIAGNOSE PLACEHOLDER\r\n", pdMS_TO_TICKS(30)) != VENDOR_ERR_OK? DIAGNOSE : MCU_INTERFACE_ERR_OK;
+    vendor_err_t err = vendor_write((uint8_t*)"HANDLING DIAGNOSE\r\n", pdMS_TO_TICKS(30));
+    switch (err) {
+        case VENDOR_ERR_OK:
+            return MCU_INTERFACE_ERR_OK; 
+        case VENDOR_TX_FULL:
+            break;
+        case VENDOR_TX_TIMEOUT:
+            break;
+        default:
+            return VENDOR_ERR_UNKNOWN;
+    }
+    return MCU_INTERFACE_ERR_DIAGNOSE;
 }   
 
 mcu_interface_err_t handle_verify_firmware() {
-    return vendor_write((uint8_t*)"HANDLE VERIFY FIRMWARE PLACEHOLDER\r\n", pdMS_TO_TICKS(30)) != VENDOR_ERR_OK? VERIFY_FIRMWARE : MCU_INTERFACE_ERR_OK;
+    vendor_err_t err = vendor_write((uint8_t*)"HANDLING VERIFY FIRMWARE\r\n", pdMS_TO_TICKS(30));
+    switch (err) {
+        case VENDOR_ERR_OK:
+            return MCU_INTERFACE_ERR_OK; 
+        case VENDOR_TX_FULL:
+            break;
+        case VENDOR_TX_TIMEOUT:
+            break;
+        default:
+            return VENDOR_ERR_UNKNOWN;
+    }
+    return MCU_INTERFACE_ERR_VERIFY_FIRMWARE;
 }
 
 mcu_interface_err_t handle_reset_target() {
-    return vendor_write((uint8_t*)"HANDLE RESET TARGET PLACEHOLDER\r\n", pdMS_TO_TICKS(30)) != VENDOR_ERR_OK? RESET_TARGET : MCU_INTERFACE_ERR_OK;
+    vendor_err_t err = vendor_write((uint8_t*)"HANDLING RESET TARGET\r\n", pdMS_TO_TICKS(30));
+    switch (err) {
+        case VENDOR_ERR_OK:
+            return MCU_INTERFACE_ERR_OK; 
+        case VENDOR_TX_FULL:
+            break;
+        case VENDOR_TX_TIMEOUT:
+            break;
+        default:
+            return VENDOR_ERR_UNKNOWN;
+    }
+    return MCU_INTERFACE_ERR_RESET_TARGET;
 }
 
 mcu_interface_err_t handle_enter_recovery() {
-    return vendor_write((uint8_t*)"HANDLE ENTER RECOVERY PLACEHOLDER\r\n", pdMS_TO_TICKS(30)) != VENDOR_ERR_OK? ENTER_RECOVERY : MCU_INTERFACE_ERR_OK;
+    vendor_err_t err = vendor_write((uint8_t*)"HANDLING ENTER RECOVERY\r\n", pdMS_TO_TICKS(30));
+    switch (err) {
+        case VENDOR_ERR_OK:
+            return MCU_INTERFACE_ERR_OK; 
+        case VENDOR_TX_FULL:
+            break;
+        case VENDOR_TX_TIMEOUT:
+            break;
+        default:
+            return VENDOR_ERR_UNKNOWN;
+    }
+    return MCU_INTERFACE_ERR_ENTER_RECOVERY;
 }
 
 mcu_interface_err_t handle_recover_target() {
-    return vendor_write((uint8_t*)"HANDLE RECOVER TARGET PLACEHOLDER\r\n", pdMS_TO_TICKS(30)) != VENDOR_ERR_OK? RECOVER_TARGET : MCU_INTERFACE_ERR_OK;
+    vendor_err_t err = vendor_write((uint8_t*)"HANDLING RECOVER TARGET\r\n", pdMS_TO_TICKS(30));
+    switch (err) {
+        case VENDOR_ERR_OK:
+            return MCU_INTERFACE_ERR_OK; 
+        case VENDOR_TX_FULL:
+            break;
+        case VENDOR_TX_TIMEOUT:
+            break;
+        default:
+            return VENDOR_ERR_UNKNOWN;
+    }
+    return MCU_INTERFACE_ERR_RECOVER_TARGET;
 }
 
 mcu_interface_err_t handle_generate_report() {
-    return vendor_write((uint8_t*)"HANDLE GENERATE REPORT PLACEHOLDER\r\n", pdMS_TO_TICKS(30)) != VENDOR_ERR_OK? GENERATE_REPORT : MCU_INTERFACE_ERR_OK;
+    vendor_err_t err = vendor_write((uint8_t*)"HANDLING GENERATE REPORT\r\n", pdMS_TO_TICKS(30));
+    switch (err) {
+        case VENDOR_ERR_OK:
+            return MCU_INTERFACE_ERR_OK; 
+        case VENDOR_TX_FULL:
+            break;
+        case VENDOR_TX_TIMEOUT:
+            break;
+        default:
+            return VENDOR_ERR_UNKNOWN;
+    }
+    return MCU_INTERFACE_ERR_GENERATE_REPORT;
 }
 
 /*  
